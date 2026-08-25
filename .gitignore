@@ -19,6 +19,9 @@ pids
 sandbox
 data
 
+# Local runtime configuration may contain provider credentials.
+config.json
+
 # PyInstaller 打包产物（由 npm run build:voice 生成）
 voice-dist/
 

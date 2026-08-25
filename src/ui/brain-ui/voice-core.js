@@ -14,6 +14,8 @@
 //
 // 点云算法移植自 ACUI (Remix)/Voice Component.html
 
+import { createVoiceStateController } from './voice-state.js';
+
 // ─── 球面采样（Fibonacci） ───
 function fibSphere(n, radius) {
   const pts = [];
@@ -82,6 +84,7 @@ export const BARGEIN_THRESHOLD = 0.09; // 振幅阈值（高于环境噪声和 A
 
 const CLOUD_WS_URL  = 'ws://127.0.0.1:3721/voice/cloud';
 const VOICE_PROVIDER_KEY = 'bailongma-voice-provider';
+const VOICE_BAIDU_MODE_KEY = 'bailongma-voice-baidu-mode';
 const VOICE_MIC_DEVICE_KEY = 'bailongma-voice-mic-device-id';
 
 // 采集分块大小（样本数）：AudioWorklet 累积到该样本数再投递；ScriptProcessor 回退也用它。
@@ -126,6 +129,7 @@ registerProcessor('pcm-capture', PcmCaptureProcessor);
 
 export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessage, getLang }) {
   const ctx = canvas.getContext('2d');
+  const voiceState = createVoiceStateController();
   let W = 0, H = 0, cx = 0, cy = 0, scale = 0;
   // canvas 的 CSS 短边，绘制帧的 resize 顺手写入（节流档位/抽稀档位都按它判）。
   // 初值取大,首帧按全量画,第一次 resize 后立刻校正。
@@ -170,6 +174,7 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
   let lastVoiceTs = 0;          // 最近一次 vol 超过 QUIET_VOL 的时刻（performance.now）
   let lastVol = 0;              // 分析帧比绘制帧密，绘制段用最近一次分析到的音量
   let ttsData = null;
+  let ttsPlaybackActive = false;
   let lastTTSVol = 0;
 
   // 画面节流档位：返回 0 = 不限（跟随显示器刷新率）
@@ -195,7 +200,16 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
   let onResume = null;       // (fromBargein) 会话恢复，各模式重置/续播
   let onState = null;        // () 会话状态变化，编排层同步 UI
 
-  function setStatus(newSk) { sk = newSk; }
+  function setVoiceState(state, options) {
+    return voiceState.transition(state, options);
+  }
+
+  function setStatus(newSk) {
+    sk = newSk;
+    if (newSk === 'error') {
+      setVoiceState('failed', { reason: 'voice-error' });
+    }
+  }
   const getStatus = () => sk;
 
   function triggerDone() {
@@ -208,14 +222,31 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
   }
 
   function setTTSAnalyser(analyser) {
-    if (analyser) {
-      ttsData = { analyser, dataArray: new Uint8Array(analyser.fftSize) };
+    if (analyser === true) {
+      ttsPlaybackActive = true;
+      ttsData = null;
+      lastTTSVol = 0;
       setStatus('speaking');
+      setVoiceState('speaking', { reason: 'tts-playback-started' });
       return;
     }
+    if (analyser) {
+      ttsPlaybackActive = true;
+      ttsData = { analyser, dataArray: new Uint8Array(analyser.fftSize) };
+      setStatus('speaking');
+      setVoiceState('speaking', { reason: 'tts-playback-started' });
+      return;
+    }
+    ttsPlaybackActive = false;
     ttsData = null;
     lastTTSVol = 0;
-    if (sk === 'speaking' && !suspendedByMedia) setStatus(micActive ? 'listening' : 'idle');
+    if (sk === 'speaking' && !suspendedByMedia) {
+      const nextState = micActive ? 'listening' : 'idle';
+      setStatus(nextState);
+      if (voiceState.getSnapshot().state === 'speaking') {
+        setVoiceState(nextState, { reason: 'tts-playback-ended' });
+      }
+    }
   }
 
   function readTTSVol() {
@@ -251,7 +282,7 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
       // 模式策略：barge-in 检测 + 活动计时（continuous）。core 只把 vol 抛出去，
       // 不含任何打断/自动发送逻辑。在视觉块之前调用，保持与原始顺序一致。
       onFrame?.(vol, {
-        ttsActive: Boolean(ttsData),
+        ttsActive: Boolean(ttsData || ttsPlaybackActive),
         ttsVol,
         suspendedByMedia,
         status: sk,
@@ -371,10 +402,21 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
   let diagCaptureMode = 'none';   // 'worklet' | 'scriptprocessor'
   let diagChunks = 0, diagBytes = 0, diagReconnects = 0, diagMaxGapMs = 0, diagLastChunkTs = 0;
   let diagTranscripts = 0, diagLastTranscriptTs = 0; // 入站：收到转录的计数 / 最近时刻
+  let diagEverSentAudio = false;
+  let diagWsOpen = false;
+  let diagLastUiText = '';
   function diag(tag, info) { if (DIAG_ON) console.log('[asr-diag] ' + tag, info ?? ''); }
+  function showVoiceHint(text, { force = false } = {}) {
+    if (!transcript || !text) return;
+    if (!force && lastTranscriptText) return;
+    if (diagLastUiText === text) return;
+    diagLastUiText = text;
+    transcript.textContent = text;
+  }
   function diagNoteTranscript() { diagTranscripts++; diagLastTranscriptTs = performance.now(); }
   function diagNoteChunk(byteLen) {
     if (!DIAG_ON) return;
+    diagEverSentAudio = true;
     diagChunks++; diagBytes += byteLen;
     const now = performance.now();
     if (diagLastChunkTs) { const gap = now - diagLastChunkTs; if (gap > diagMaxGapMs) diagMaxGapMs = gap; }
@@ -398,6 +440,11 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
         + ' tx=' + diagTranscripts
         + ' sinceTx=' + sinceTx + 'ms'
         + ' reconBuf=' + reconnectBuffer.length);
+      if (!lastTranscriptText) {
+        if (!diagWsOpen) showVoiceHint('麦克风已开启，正在连接云端识别...');
+        else if (!diagEverSentAudio) showVoiceHint('麦克风已开启，但还没采集到音频。请检查输入设备或在设置里刷新麦克风。');
+        else if (diagTranscripts === 0) showVoiceHint('麦克风与云端识别已连接，正在听。说话后这里会显示识别文字。');
+      }
       diagChunks = 0; diagBytes = 0; diagMaxGapMs = 0;
     }, 3000);
   }
@@ -405,6 +452,9 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
     if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
     diagLastChunkTs = 0; diagReconnects = 0;
     diagTranscripts = 0; diagLastTranscriptTs = 0;
+    diagEverSentAudio = false;
+    diagWsOpen = false;
+    diagLastUiText = '';
   }
 
   // ─── 识别停滞看门狗（self-healing） ───
@@ -417,11 +467,16 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
   let watchdogTimer = null;
   let lastInboundTs = 0;             // 最近收到转录的时刻（Date.now）
   let lastLoudTs = 0;                // 最近听到人声级音量的时刻（Date.now，drawFrame 写）
+  function isBaiduRestMode() {
+    return (localStorage.getItem(VOICE_PROVIDER_KEY) || '') === 'baidu'
+      && (localStorage.getItem(VOICE_BAIDU_MODE_KEY) || 'rest') === 'rest';
+  }
   function startWatchdog() {
     if (!WATCHDOG_ON || watchdogTimer) return;
     lastInboundTs = Date.now();
     watchdogTimer = setInterval(() => {
       if (!micActive || suspendedByMedia) return;
+      if (isBaiduRestMode()) return; // Baidu REST only returns text after flush.
       if (!cloudWs || cloudWs.readyState !== WebSocket.OPEN) return; // 重连窗口内不判
       const now = Date.now();
       if (now - lastLoudTs < 1200 && now - lastInboundTs > STALL_RECONNECT_MS) {
@@ -442,6 +497,7 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
   let reconnectBuffer = []; // Int16Array 块
   // PTT 按住期间禁用自动发送的门控位（PTT 写、continuous 读）
   let pttHolding = false;
+  let startSessionPromise = null;
   // PTT 松手已发送后的「吞尾」截止时刻：常开模式下 mic 不停，flushAsr 会让云端再吐一条
   // 属于同一句的尾随 final。这条若放行会被常开策略当作新内容二次发送 → 在此窗口内吞掉。
   let transcriptSuppressUntil = 0;
@@ -525,15 +581,37 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
   }
 
   // ─── 语音识别结果发送（实际投递动作；何时调由模式策略决定） ───
-  function sendRecognizedVoiceText() {
+  async function sendRecognizedVoiceText() {
     if (!lastTranscriptText) return;
+    const text = lastTranscriptText;
+    console.log('[voice-send] recognized text -> chat', text.slice(0, 120));
+    setVoiceState('thinking', {
+      reason: 'voice-message-sent',
+      newTurn: true,
+      meta: { channel: 'voice', textLength: text.length },
+    });
     // 直接把识别文本作为消息发送，完全不经过聊天输入框(msg-input)——不留草稿、不会被失焦误发。
-    getSendMessage?.({ channel: '语音识别', label: 'You · 语音对话', text: lastTranscriptText });
+    let ok;
+    try {
+      ok = await getSendMessage?.({ channel: '语音识别', label: 'You · 语音对话', text });
+    } catch (err) {
+      setVoiceState('failed', { reason: 'voice-message-send-failed', meta: { error: err?.message || String(err) } });
+      console.warn('[voice-send] chat send failed, keeping transcript', err);
+      if (transcript) transcript.textContent = text;
+      return false;
+    }
+    if (ok === false) {
+      setVoiceState('failed', { reason: 'voice-message-send-failed' });
+      console.warn('[voice-send] chat send failed, keeping transcript');
+      if (transcript) transcript.textContent = text;
+      return false;
+    }
     // 发出后清空累积：已发的内容不能再被后续语音追加/重发。
     // （此处只清文字层，reconnectBuffer 是尚未识别的原始音频，由音频层自管理）
     resetTranscriptAccumulation();
     lastTranscriptText = '';
     if (transcript) transcript.textContent = '';
+    return true;
   }
 
   // PTT 松手发送后，在 ms 毫秒内吞掉云端 flush 吐出的尾随 transcript（同一句的重复）。
@@ -547,6 +625,10 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
       if (!(msg.text || '').trim()) return;
       diagNoteTranscript(); // 入站诊断：记一次收到转录（含 interim）
       lastInboundTs = Date.now(); // 看门狗：刷新「最近收到转录」时刻
+      const canonicalState = voiceState.getSnapshot().state;
+      if (canonicalState === 'idle' || canonicalState === 'completed' || canonicalState === 'failed') {
+        setVoiceState('listening', { reason: 'voice-input-detected' });
+      }
       // PTT 刚发过这条话 → flush 的尾随 final 属于同一句，吞掉避免常开策略二次发送
       if (Date.now() < transcriptSuppressUntil) {
         resetTranscriptAccumulation();
@@ -615,6 +697,16 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
       }
       // 权限拒绝时球体变红，不在 transcript 显示文字
       setStatus('error');
+      if (transcript) {
+        const name = e?.name || '';
+        if (name === 'NotAllowedError' || name === 'SecurityError') {
+          transcript.textContent = '麦克风权限未开启。请在浏览器地址栏左侧允许麦克风，然后刷新页面。';
+        } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+          transcript.textContent = '没有检测到可用麦克风。请检查输入设备后，在设置里刷新麦克风列表。';
+        } else {
+          transcript.textContent = `麦克风启动失败：${e?.message || name || '未知错误'}`;
+        }
+      }
       return null;
     }
   }
@@ -637,8 +729,11 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
     ws.onopen = () => {
       if (cloudWs !== ws) return;
       const provider = localStorage.getItem(VOICE_PROVIDER_KEY) || 'aliyun';
+      const baiduMode = localStorage.getItem(VOICE_BAIDU_MODE_KEY) || 'rest';
       const lang = getLang?.()?.split('-')[0] || 'zh';
-      ws.send(JSON.stringify({ type: 'config', provider, lang }));
+      ws.send(JSON.stringify({ type: 'config', provider, lang, baiduMode }));
+      diagWsOpen = true;
+      showVoiceHint('麦克风已开启，云端识别已连接。请说话。');
       setStatus('listening');
       lastInboundTs = Date.now(); // 看门狗：（重）连后给一个新鲜起点，避免连上瞬间误判停滞
       // 补发重连死区里暂存的音频，避免断连期间说的话丢失
@@ -660,6 +755,7 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
 
     ws.onclose = () => {
       if (cloudWs !== ws) return; // 已被新连接取代，忽略旧连接的 close 事件
+      diagWsOpen = false;
       cloudWs = null;
       if (!cloudWsIntentional && micActive) {
         // 非主动断开（超时/网络抖动）且用户仍在录音 → 自动重连，保留已识别文字。
@@ -742,6 +838,7 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
         cloudWorkletNode = node;
         diagCaptureMode = 'worklet';
         diag('capture=worklet', 'sr=' + audioCtx.sampleRate + ' chunk=' + PCM_CHUNK_SAMPLES);
+        showVoiceHint('麦克风已开启，正在连接云端识别...');
         return;
       } catch (e) {
         diag('worklet-failed → fallback scriptprocessor', e?.message);
@@ -761,6 +858,7 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
     };
     diagCaptureMode = 'scriptprocessor';
     diag('capture=scriptprocessor', 'sr=' + audioCtx.sampleRate);
+    showVoiceHint('麦克风已开启，正在连接云端识别...');
   }
 
   function stopCloudStream({ preserveProcessor = false } = {}) {
@@ -768,7 +866,7 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
     const ws = cloudWs;
     try {
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'flush' }));
+        if (!isBaiduRestMode()) ws.send(JSON.stringify({ type: 'flush' }));
         setTimeout(() => { try { ws.close(); } catch {} }, 200);
       } else {
         ws?.close();
@@ -797,6 +895,9 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
   // ─── 会话生命周期 ───
   // 开启会话：开麦 + 接 ASR 流。返回 stream（失败返回 null）。
   async function startSession() {
+    if (startSessionPromise) return startSessionPromise;
+    if (micActive && micData?.stream) return micData.stream;
+    startSessionPromise = (async () => {
     micActive = true;
     userWantedMic = true;
     suspendedByMedia = false;
@@ -808,8 +909,21 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
       syncState();
       return null;
     }
-    await startCloudStream(stream);
-    return stream;
+    try {
+      await startCloudStream(stream);
+      setVoiceState('listening', { reason: 'microphone-started' });
+      return stream;
+    } catch (err) {
+      stopSession();
+      setVoiceState('failed', { reason: 'voice-session-start-failed', meta: { error: err?.message || String(err) } });
+      throw err;
+    }
+    })();
+    try {
+      return await startSessionPromise;
+    } finally {
+      startSessionPromise = null;
+    }
   }
 
   // 停止会话（= 原 stopVoiceInput 的 core 部分）。模式自有的计时器/标志由 onSessionStop 清。
@@ -830,6 +944,10 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
     diagStop();
     stopWatchdog();
     setStatus('idle');
+    const canonicalState = voiceState.getSnapshot().state;
+    if (!['thinking', 'executing'].includes(canonicalState)) {
+      setVoiceState('idle', { reason: keepIntent ? 'media-suspended' : 'microphone-stopped' });
+    }
     if (transcript) transcript.textContent = '';
     syncState();
   }
@@ -852,12 +970,18 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
     bargeinBuffering = true;
     stopCloudStream({ preserveProcessor: true }); // 保留 Processor，只断 WS
     setStatus('speaking');
+    setVoiceState('speaking', { reason: 'tts-session-started' });
   }
 
   // 会话恢复（= 原 resumeVoiceInputFromMedia）。fromBargein=true 表示由打断检测触发。
   async function resumeSession(fromBargein = false) {
     if (!suspendedByMedia || !userWantedMic) return;
     suspendedByMedia = false;
+
+    if (fromBargein) {
+      setVoiceState('interrupted', { reason: 'user-barge-in' });
+    }
+    setVoiceState('listening', { reason: fromBargein ? 'barge-in-listening' : 'media-resumed' });
 
     // 拿走缓冲区快照并立刻停止写入，避免 WS 重连期间继续堆积
     const bufferedChunks = bargeinBuffer.slice();
@@ -878,8 +1002,9 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
       bargeinWs.onopen = () => {
         if (cloudWs !== bargeinWs) return;
         const provider = localStorage.getItem(VOICE_PROVIDER_KEY) || 'aliyun';
+        const baiduMode = localStorage.getItem(VOICE_BAIDU_MODE_KEY) || 'rest';
         const lang = getLang?.()?.split('-')[0] || 'zh';
-        bargeinWs.send(JSON.stringify({ type: 'config', provider, lang }));
+        bargeinWs.send(JSON.stringify({ type: 'config', provider, lang, baiduMode }));
         lastInboundTs = Date.now(); // 看门狗：打断重连后给新鲜起点
         // 先把预缓冲的历史音频一次性发出，补回打断前说的内容
         for (const chunk of bufferedChunks) {
@@ -923,6 +1048,9 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
     // 渲染 / 状态
     setStatus,
     getStatus,
+    getVoiceState: () => voiceState.getSnapshot(),
+    setVoiceState,
+    subscribeVoiceState: (listener) => voiceState.subscribe(listener),
     triggerDone,
     startRenderLoop,
     // 会话生命周期
@@ -947,6 +1075,7 @@ export function createVoiceCore({ canvas, transcript, getChatInput, getSendMessa
     getText: () => lastTranscriptText,
     setText: (v) => { lastTranscriptText = v; },
     setTTSAnalyser,
+    isBaiduRestMode,
     // 清当前句未定稿 interim：PTT 开始新一轮说话时调用，避免上一段残留 interim
     // 在恰好重连时被 commitPendingInterim 提级进来。
     clearPendingInterim: () => { pendingInterim = ''; },

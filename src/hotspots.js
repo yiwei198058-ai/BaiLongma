@@ -3,23 +3,47 @@ import crypto from 'crypto'
 import { paths } from './paths.js'
 import { upsertMemoryByMemId } from './db.js'
 import { nowTimestamp } from './time.js'
+import { config as llmConfig } from './config.js'
 
 const DEFAULT_REFRESH_MINUTES = 30
+const DEFAULT_NEWS_REFRESH_MINUTES = 20
+const DEFAULT_ANALYSIS_REFRESH_HOURS = 6
 const HOTSPOT_CONTEXT_TTL_MINUTES = 60
 const DEFAULT_TIMEOUT_MS = 10000
 const USER_AGENT = 'Bailongma/1.0 (+https://localhost)'
 const PUBLIC_HOTDATA_API_KEY = 'zIisgRZJLLXgqKCwBirNLegtNNRuL70eBsbHXPxEBWU='
 
-const PLATFORM_ORDER = ['douyin', 'xiaohongshu', 'wechat', 'weibo']
+const NEWS_FEEDS = [
+  { label: '中新网即时', url: 'https://www.chinanews.com.cn/rss/scroll-news.xml', category: '综合' },
+  { label: '中新网时政', url: 'https://www.chinanews.com.cn/rss/china.xml', category: '政策' },
+  { label: '中新网财经', url: 'https://www.chinanews.com.cn/rss/finance.xml', category: '财经' },
+  { label: '量子位', url: 'https://www.qbitai.com/feed', category: '科技' },
+  { label: 'Hacker News', url: 'https://hnrss.org/frontpage', category: '科技' },
+]
+
+const PLATFORM_ORDER = ['ai', 'douyin', 'xiaohongshu', 'wechat', 'weibo']
 const PLATFORM_LABELS = {
+  ai: 'AI人工智能',
   douyin: '抖音',
   xiaohongshu: '小红书',
   wechat: '微信热点',
   weibo: '微博',
 }
 
+const AI_TOPIC_QUERIES = [
+  { title: 'GitHub 近 30 天 AI 开源项目热度', tag: 'GitHub' },
+  { title: 'AI Agent 工具链与自动化工作流', tag: 'Agent' },
+  { title: '大模型推理加速与上下文工程', tag: 'LLM' },
+  { title: '多模态模型与 AI 视频生成', tag: '多模态' },
+  { title: 'AI 编程助手与代码审查', tag: 'Coding' },
+]
+
 let cache = null
 let inFlight = null
+let liveFeedCache = null
+let liveFeedInFlight = null
+let analysisCache = null
+let analysisInFlight = null
 let panelActiveUntilMs = 0
 let panelState = {
   active: false,
@@ -73,11 +97,34 @@ function readHotspotConfig() {
     Math.min(24 * 60, Number(stored.refreshMinutes || process.env.HOTSPOT_REFRESH_MINUTES || DEFAULT_REFRESH_MINUTES) || DEFAULT_REFRESH_MINUTES)
   )
 
+  const newsRefreshMinutes = Math.max(
+    10,
+    Math.min(30, Number(stored.newsRefreshMinutes || process.env.HOTSPOT_NEWS_REFRESH_MINUTES || DEFAULT_NEWS_REFRESH_MINUTES) || DEFAULT_NEWS_REFRESH_MINUTES)
+  )
+
+  const analysisRefreshHours = Math.max(
+    1,
+    Math.min(24, Number(stored.analysisRefreshHours || process.env.HOTSPOT_ANALYSIS_REFRESH_HOURS || DEFAULT_ANALYSIS_REFRESH_HOURS) || DEFAULT_ANALYSIS_REFRESH_HOURS)
+  )
+
   const tianapiKey = String(stored.tianapiKey || process.env.TIANAPI_KEY || process.env.TIANAPI_DOUYIN_KEY || '').trim()
+  const customNewsFeeds = Array.isArray(stored.newsFeeds)
+    ? stored.newsFeeds.map(item => {
+      if (typeof item === 'string') return { label: '自定义新闻源', url: item, category: '新闻' }
+      return {
+        label: String(item?.label || item?.name || '自定义新闻源').trim(),
+        url: String(item?.url || '').trim(),
+        category: String(item?.category || '新闻').trim(),
+      }
+    }).filter(item => item.url)
+    : []
 
   return {
     provider: String(stored.provider || process.env.HOTSPOT_PROVIDER || 'auto').trim().toLowerCase(),
     refreshMinutes,
+    newsRefreshMinutes,
+    analysisRefreshHours,
+    newsFeeds: customNewsFeeds.length ? customNewsFeeds : NEWS_FEEDS,
     tianapiKey,
     douyin: {
       url: String(stored.customDouyinUrl || process.env.HOTSPOT_DOUYIN_URL || '').trim(),
@@ -106,6 +153,18 @@ function isCacheFresh(now = Date.now()) {
   return now - cache.fetchedAtMs < ttlMs
 }
 
+function isLiveFeedFresh(config, now = Date.now()) {
+  if (!liveFeedCache?.fetchedAtMs) return false
+  const ttlMs = (config?.newsRefreshMinutes || DEFAULT_NEWS_REFRESH_MINUTES) * 60 * 1000
+  return now - liveFeedCache.fetchedAtMs < ttlMs
+}
+
+function isAnalysisFresh(config, now = Date.now()) {
+  if (!analysisCache?.analyzedAtMs) return false
+  const ttlMs = (config?.analysisRefreshHours || DEFAULT_ANALYSIS_REFRESH_HOURS) * 60 * 60 * 1000
+  return now - analysisCache.analyzedAtMs < ttlMs
+}
+
 function isContextFresh(now = Date.now()) {
   if (!cache?.fetchedAtMs) return false
   const ttlMs = HOTSPOT_CONTEXT_TTL_MINUTES * 60 * 1000
@@ -130,8 +189,151 @@ async function fetchJson(url, options = {}) {
   }
 }
 
+async function fetchText(url, options = {}) {
+  const res = await globalThis.fetch(url, {
+    headers: {
+      'User-Agent': USER_AGENT,
+      Accept: 'application/rss+xml,application/atom+xml,application/xml,text/xml,text/plain,*/*',
+      ...(options.headers || {}),
+    },
+    signal: AbortSignal.timeout(options.timeoutMs || DEFAULT_TIMEOUT_MS),
+  })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  return res.text()
+}
+
+function decodeEntities(value = '') {
+  return String(value || '')
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+}
+
+function stripHtml(value = '') {
+  return decodeEntities(value)
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function extractTag(block = '', tag) {
+  const match = String(block).match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i'))
+  return match ? stripHtml(match[1]) : ''
+}
+
+function parseFeedDate(value = '') {
+  if (!value) return ''
+  const date = new Date(stripHtml(value))
+  return Number.isNaN(date.getTime()) ? '' : date.toISOString()
+}
+
+function cleanFeedSummary(value = '') {
+  return stripHtml(value)
+    .replace(/Article URL:\s*https?:\/\/\S+/gi, '')
+    .replace(/Comments URL:\s*https?:\/\/\S+/gi, '')
+    .replace(/https?:\/\/\S+/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function parseFeedItems(xml = '', source = {}, limit = 8) {
+  const itemBlocks = [...String(xml).matchAll(/<item\b[\s\S]*?<\/item>/gi)].map(m => m[0])
+  const entryBlocks = [...String(xml).matchAll(/<entry\b[\s\S]*?<\/entry>/gi)].map(m => m[0])
+  const blocks = itemBlocks.length ? itemBlocks : entryBlocks
+  return blocks.slice(0, limit).map((block) => {
+    const title = extractTag(block, 'title')
+    const desc = cleanFeedSummary(extractTag(block, 'description') || extractTag(block, 'summary') || extractTag(block, 'content'))
+    let link = extractTag(block, 'link')
+    if (!link) link = block.match(/<link[^>]*href=["']([^"']+)["']/i)?.[1] || ''
+    const publishedAt = parseFeedDate(extractTag(block, 'pubDate') || extractTag(block, 'updated') || extractTag(block, 'published') || extractTag(block, 'dc:date'))
+    if (!title || !publishedAt) return null
+    return {
+      title,
+      desc: desc.slice(0, 120),
+      publishedAt,
+      cat: source.category || '新闻',
+      source: source.label || '新闻源',
+      loc: source.label || '新闻源',
+      url: link,
+    }
+  }).filter(Boolean)
+}
+
+function normalizeNewsKey(title = '') {
+  return normalizeSearchText(title).slice(0, 90)
+}
+
+async function fetchLiveFeed(config) {
+  const fetchedAt = new Date()
+  const results = await Promise.allSettled((config.newsFeeds || NEWS_FEEDS).map(async (source) => {
+    const xml = await fetchText(source.url, { timeoutMs: 9000 })
+    return parseFeedItems(xml, source, 8)
+  }))
+
+  const seen = new Set()
+  const items = []
+  const status = []
+  results.forEach((result, idx) => {
+    const source = (config.newsFeeds || NEWS_FEEDS)[idx]
+    if (result.status === 'rejected') {
+      status.push({ source: source.label, ok: false, error: result.reason?.message || String(result.reason) })
+      return
+    }
+    status.push({ source: source.label, ok: true, count: result.value.length })
+    for (const item of result.value) {
+      const key = normalizeNewsKey(item.title)
+      if (!key || seen.has(key)) continue
+      seen.add(key)
+      items.push(item)
+    }
+  })
+
+  items.sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime())
+  return {
+    ok: true,
+    refreshMinutes: config.newsRefreshMinutes,
+    fetchedAt: fetchedAt.toISOString(),
+    fetchedAtMs: fetchedAt.getTime(),
+    items: items.slice(0, 24),
+    status,
+  }
+}
+
+async function getLiveFeed(config, { force = false } = {}) {
+  if (!force && isLiveFeedFresh(config)) return liveFeedCache
+  if (liveFeedInFlight) return liveFeedInFlight
+  liveFeedInFlight = fetchLiveFeed(config)
+    .then(result => {
+      liveFeedCache = result
+      return result
+    })
+    .catch(err => {
+      if (liveFeedCache) return { ...liveFeedCache, stale: true, error: err.message }
+      return {
+        ok: false,
+        refreshMinutes: config.newsRefreshMinutes,
+        fetchedAt: new Date().toISOString(),
+        fetchedAtMs: Date.now(),
+        items: [],
+        status: [],
+        error: err.message,
+      }
+    })
+    .finally(() => {
+      liveFeedInFlight = null
+    })
+  return liveFeedInFlight
+}
+
 function formatHeat(value) {
   const n = Number(value)
+  if (Number.isFinite(n) && n <= 0) return ''
   if (!Number.isFinite(n)) return String(value || '')
   if (n >= 100000000) return `${(n / 100000000).toFixed(n >= 1000000000 ? 1 : 2).replace(/\.0+$/, '')}亿`
   if (n >= 10000) return `${Math.round(n / 10000)}万`
@@ -216,6 +418,286 @@ function formatHotspotLines(items = []) {
   }).join('\n')
 }
 
+const REGION_RULES = [
+  { name: '中国地区', re: /中国|北京|上海|广州|深圳|香港|台湾|澳门|杭州|南京|成都|重庆|武汉|西安|天津|广东|浙江|江苏|四川|河南|山东|河北|福建|湖南|湖北/ },
+  { name: '亚太地区', re: /日本|韩国|朝鲜|印度|东南亚|新加坡|马来西亚|泰国|越南|菲律宾|印尼|澳大利亚|新西兰|亚太|亚洲/ },
+  { name: '北美地区', re: /美国|加拿大|硅谷|华盛顿|纽约|洛杉矶|旧金山|北美|美联储|OpenAI|Google|Microsoft|Meta|Apple|Nvidia|Anthropic/ },
+  { name: '欧洲地区', re: /欧洲|欧盟|英国|法国|德国|意大利|西班牙|荷兰|瑞士|乌克兰|俄罗斯|伦敦|巴黎|柏林/ },
+  { name: '中东地区', re: /中东|以色列|伊朗|巴勒斯坦|加沙|沙特|阿联酋|卡塔尔|叙利亚|也门|黎巴嫩/ },
+  { name: '南美地区', re: /南美|巴西|阿根廷|智利|秘鲁|哥伦比亚|委内瑞拉/ },
+  { name: '非洲地区', re: /非洲|埃及|南非|尼日利亚|肯尼亚|埃塞俄比亚|摩洛哥/ },
+]
+
+const CATEGORY_RULES = [
+  { name: '科技', re: /AI|人工智能|模型|大模型|芯片|机器人|Agent|OpenAI|DeepSeek|英伟达|Nvidia|算法|算力|数据中心|GitHub|Hacker News/i },
+  { name: '财经', re: /股|基金|市场|经济|金融|央行|美联储|汇率|美元|人民币|财报|通胀|关税|投资|融资|上市|债券/ },
+  { name: '政策', re: /政策|监管|法规|法案|会议|政府|外交|制裁|法院|总统|首相|部委|国会|选举/ },
+  { name: '社会', re: /事故|警方|调查|教育|医疗|医院|学校|就业|民生|通报|争议|回应/ },
+  { name: '灾害', re: /地震|洪水|暴雨|台风|火灾|山火|灾害|坠毁|爆炸|袭击|死亡|伤亡|救援/ },
+  { name: '文娱', re: /电影|音乐|明星|综艺|游戏|体育|比赛|演唱会|票房|冠军|世界杯|奥运/ },
+]
+
+const NEGATIVE_RE = /事故|灾|死亡|伤亡|爆炸|坠毁|袭击|冲突|战争|危机|风险|下跌|暴跌|裁员|诈骗|调查|处罚|制裁|泄露|故障|抗议|封禁|争议|回应|辟谣|造假|感染|疫情/
+const POSITIVE_RE = /突破|发布|上线|增长|上涨|创新|合作|达成|获批|冠军|成功|开放|升级|改善|恢复|盈利|融资|获奖|推荐|新高/
+const ALERT_RE = /预警|紧急|突发|事故|爆炸|地震|台风|暴雨|洪水|袭击|死亡|伤亡|战争|冲突|火灾|坠毁|召回|泄露|风险/
+
+function scoreHeat(item = {}, idx = 0) {
+  const rank = Number(item.rank || idx + 1)
+  const rankScore = Math.max(4, 60 - Math.min(rank, 50))
+  const heatText = String(item.heat || '')
+  const heatNumber = Number(heatText.replace(/[^\d.]/g, ''))
+  const heatScore = Number.isFinite(heatNumber) ? Math.min(40, Math.log10(Math.max(heatNumber, 10)) * 8) : 8
+  return rankScore + heatScore
+}
+
+function itemText(item = {}) {
+  return [hotspotTitle(item), item.desc, item.summary, item.source].filter(Boolean).join(' ')
+}
+
+function summarizeFocus(topItems = [], liveItems = []) {
+  const titles = [
+    ...topItems.slice(0, 5).map(hotspotTitle),
+    ...liveItems.slice(0, 3).map(item => item.title),
+  ].filter(Boolean)
+  if (!titles.length) return '暂无足够真实热点样本生成态势摘要。'
+  return `当前热榜样本聚焦：${titles.slice(0, 4).join('；')}。`
+}
+
+function analyzeSituation(platforms = {}, liveItems = [], config = readHotspotConfig()) {
+  const analyzedAt = new Date()
+  const hotspotItems = PLATFORM_ORDER.flatMap(platform => (
+    Array.isArray(platforms?.[platform]) ? platforms[platform].slice(0, 12) : []
+  ))
+  const allItems = [
+    ...hotspotItems,
+    ...liveItems.slice(0, 12).map((item, idx) => ({
+      platform: 'news',
+      rank: idx + 1,
+      title: item.title,
+      heat: '',
+      source: item.source,
+      desc: item.desc,
+    })),
+  ].filter(item => itemText(item))
+
+  const regionScores = new Map(REGION_RULES.map(rule => [rule.name, 0]))
+  const categoryScores = new Map()
+  let negative = 0
+  let positive = 0
+  let alertCount = 0
+  let highAttention = 0
+
+  allItems.forEach((item, idx) => {
+    const text = itemText(item)
+    const weight = scoreHeat(item, idx)
+    if (idx < 20 || weight >= 38) highAttention += 1
+    if (ALERT_RE.test(text)) alertCount += 1
+    if (NEGATIVE_RE.test(text)) negative += weight
+    if (POSITIVE_RE.test(text)) positive += weight
+    for (const rule of REGION_RULES) {
+      if (rule.re.test(text)) regionScores.set(rule.name, (regionScores.get(rule.name) || 0) + weight)
+    }
+    for (const rule of CATEGORY_RULES) {
+      if (rule.re.test(text)) categoryScores.set(rule.name, (categoryScores.get(rule.name) || 0) + weight)
+    }
+  })
+
+  const fallbackRegionScore = Math.max(12, Math.round(allItems.length * 2))
+  if ([...regionScores.values()].every(value => value <= 0) && allItems.length) {
+    regionScores.set('综合热点', fallbackRegionScore)
+  }
+
+  const maxRegion = Math.max(1, ...regionScores.values())
+  const regionAttention = [...regionScores.entries()]
+    .filter(([, score]) => score > 0)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
+    .map(([name, score]) => ({
+      name,
+      value: Math.max(8, Math.min(100, Math.round((score / maxRegion) * 100))),
+    }))
+
+  const categoryFocus = [...categoryScores.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([name]) => name)
+
+  const totalSignal = Math.max(1, positive + negative)
+  const sentimentRaw = Math.round(50 + ((positive - negative) / totalSignal) * 32 + Math.min(12, allItems.length / 4))
+  const sentimentScore = Math.max(0, Math.min(100, sentimentRaw))
+  const sentimentLabel = sentimentScore >= 75 ? '高热偏正'
+    : sentimentScore >= 58 ? '中性偏热'
+      : sentimentScore >= 42 ? '中性'
+        : sentimentScore >= 25 ? '偏谨慎'
+          : '风险偏高'
+
+  const confidence = allItems.length >= 45 ? 88 : allItems.length >= 25 ? 80 : allItems.length >= 12 ? 68 : 52
+  const summary = summarizeFocus(hotspotItems, liveItems)
+  const topCategory = categoryFocus[0] || '综合'
+
+  return {
+    ok: true,
+    mode: 'local-low-token',
+    refreshHours: config.analysisRefreshHours,
+    analyzedAt: analyzedAt.toISOString(),
+    analyzedAtMs: analyzedAt.getTime(),
+    summary,
+    categoryFocus,
+    regionAttention,
+    sentiment: {
+      score: sentimentScore,
+      label: sentimentLabel,
+      delta: '6h缓存',
+    },
+    stats: {
+      alerts: alertCount,
+      alertsDelta: '真实源规则计算',
+      highAttention,
+      highAttentionDelta: `${topCategory}占优`,
+      confidence,
+      confidenceDelta: `${allItems.length}条样本 / ${config.analysisRefreshHours}小时分析`,
+    },
+    contextSummary: [
+      summary,
+      categoryFocus.length ? `主题侧重：${categoryFocus.join('、')}。` : '',
+      regionAttention.length ? `区域关注：${regionAttention.slice(0, 3).map(item => `${item.name}${item.value}%`).join('、')}。` : '',
+      `情绪指数：${sentimentScore}（${sentimentLabel}）。`,
+    ].filter(Boolean).join('\n'),
+  }
+}
+
+function parseJsonObject(text = '') {
+  const raw = String(text || '').trim()
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]
+  const candidate = fenced || raw.match(/\{[\s\S]*\}/)?.[0] || raw
+  return JSON.parse(candidate)
+}
+
+function compactAnalysisInput(platforms = {}, liveItems = []) {
+  const hotspotLines = PLATFORM_ORDER.flatMap(platform => {
+    const list = Array.isArray(platforms?.[platform]) ? platforms[platform] : []
+    return list.slice(0, 6).map(item => `${platformLabel(platform)}#${item.rank || ''} ${hotspotTitle(item)} ${item.heat || ''}`.trim())
+  })
+  const newsLines = liveItems.slice(0, 8).map(item => `${item.publishedAt || ''} ${item.source || item.loc || 'news'} ${item.title}`.trim())
+  return [
+    'HOTSPOTS:',
+    ...hotspotLines,
+    'NEWS:',
+    ...newsLines,
+  ].join('\n').slice(0, 6000)
+}
+
+function clampPercent(value, fallback = 0) {
+  const n = Math.round(Number(value))
+  if (!Number.isFinite(n)) return fallback
+  return Math.max(0, Math.min(100, n))
+}
+
+function normalizeAiSituation(raw, fallback, config) {
+  const analyzedAt = new Date()
+  const regionAttention = Array.isArray(raw?.regionAttention)
+    ? raw.regionAttention.slice(0, 6).map(item => ({
+      name: String(item?.name || '').trim(),
+      value: clampPercent(item?.value ?? item?.score ?? item?.percent, 0),
+    })).filter(item => item.name && item.value > 0)
+    : []
+  const sentimentScore = clampPercent(raw?.sentiment?.score, fallback.sentiment.score)
+  const sentimentLabel = String(raw?.sentiment?.label || fallback.sentiment.label || '中性').trim()
+  const categoryFocus = Array.isArray(raw?.categoryFocus)
+    ? raw.categoryFocus.map(item => String(item || '').trim()).filter(Boolean).slice(0, 3)
+    : fallback.categoryFocus
+  const summary = String(raw?.summary || fallback.summary || '').trim().slice(0, 220)
+  const stats = raw?.stats || {}
+  return {
+    ...fallback,
+    mode: 'ai-low-token',
+    refreshHours: config.analysisRefreshHours,
+    analyzedAt: analyzedAt.toISOString(),
+    analyzedAtMs: analyzedAt.getTime(),
+    summary,
+    categoryFocus,
+    regionAttention: regionAttention.length ? regionAttention : fallback.regionAttention,
+    sentiment: {
+      score: sentimentScore,
+      label: sentimentLabel,
+      delta: '6h AI缓存',
+    },
+    stats: {
+      alerts: Number.isFinite(Number(stats.alerts)) ? Number(stats.alerts) : fallback.stats.alerts,
+      alertsDelta: String(stats.alertsDelta || 'AI低频分析').slice(0, 24),
+      highAttention: Number.isFinite(Number(stats.highAttention)) ? Number(stats.highAttention) : fallback.stats.highAttention,
+      highAttentionDelta: String(stats.highAttentionDelta || fallback.stats.highAttentionDelta || '').slice(0, 24),
+      confidence: clampPercent(stats.confidence, fallback.stats.confidence),
+      confidenceDelta: String(stats.confidenceDelta || `${config.analysisRefreshHours}小时AI分析`).slice(0, 32),
+    },
+    contextSummary: [
+      summary,
+      categoryFocus.length ? `主题侧重：${categoryFocus.join('、')}。` : '',
+      (regionAttention.length ? regionAttention : fallback.regionAttention).length
+        ? `区域关注：${(regionAttention.length ? regionAttention : fallback.regionAttention).slice(0, 3).map(item => `${item.name}${item.value}%`).join('、')}。`
+        : '',
+      `情绪指数：${sentimentScore}（${sentimentLabel}）。`,
+    ].filter(Boolean).join('\n'),
+  }
+}
+
+async function analyzeSituationWithAi(platforms = {}, liveItems = [], config = readHotspotConfig()) {
+  const fallback = analyzeSituation(platforms, liveItems, config)
+  if (!llmConfig?.apiKey || !llmConfig?.model) return fallback
+
+  const systemPrompt = `你是热点态势分析器。只基于用户提供的热榜标题和新闻标题输出 JSON，不要补充未知事实。目标是低 token：摘要短、字段少。
+输出 JSON：
+{
+  "summary": "120字以内中文摘要",
+  "categoryFocus": ["最多3个主题"],
+  "regionAttention": [{"name":"区域名","value":0-100}],
+  "sentiment": {"score":0-100,"label":"中性/中性偏热/偏谨慎/风险偏高/高热偏正"},
+  "stats": {"alerts":数字,"alertsDelta":"短文本","highAttention":数字,"highAttentionDelta":"短文本","confidence":0-100,"confidenceDelta":"短文本"}
+}`
+
+  try {
+    const { callLLM } = await import('./llm.js')
+    const result = await callLLM({
+      systemPrompt,
+      message: compactAnalysisInput(platforms, liveItems),
+      tools: [],
+      maxTokens: 420,
+      temperature: 0.2,
+      topP: 0.8,
+      thinking: false,
+      mustReply: false,
+      localReply: true,
+      toolContext: { currentChannel: 'hotspot-analysis' },
+    })
+    const parsed = parseJsonObject(result?.content || '')
+    return normalizeAiSituation(parsed, fallback, config)
+  } catch (err) {
+    console.warn('[Hotspot] AI 态势分析失败，已回退本地规则:', err.message)
+    return { ...fallback, aiError: err.message }
+  }
+}
+
+async function getSituationAnalysis(platforms, liveItems, config, { force = false } = {}) {
+  if (!force && isAnalysisFresh(config)) return analysisCache
+  if (analysisInFlight) return analysisInFlight
+  analysisInFlight = Promise.resolve()
+    .then(() => analyzeSituationWithAi(platforms, liveItems, config))
+    .then(result => {
+      analysisCache = result
+      return result
+    })
+    .catch(err => {
+      if (analysisCache) return { ...analysisCache, stale: true, error: err.message }
+      const result = analyzeSituation(platforms, liveItems, config)
+      analysisCache = { ...result, error: err.message }
+      return analysisCache
+    })
+    .finally(() => {
+      analysisInFlight = null
+    })
+  return analysisInFlight
+}
+
 function matchHotspots(message = '', items = getCurrentHotspotItems(20)) {
   const normalizedMessage = normalizeSearchText(message)
   if (!normalizedMessage) return []
@@ -284,22 +766,12 @@ function persistMentionedHotspot(match, message = '') {
   })
 }
 
-function contextPlatformBlocks() {
-  const blocks = []
-  for (const platform of PLATFORM_ORDER) {
-    const items = (cache?.platforms?.[platform] || []).filter(item => hotspotTitle(item)).slice(0, 10)
-    if (!items.length) continue
-    const source = items[0]?.source || 'hotspot-api'
-    blocks.push(`Current ${platformLabel(platform)} hot list (source: ${source}):\n${formatHotspotLines(items)}`)
-  }
-  return blocks.join('\n\n')
-}
-
 export function buildHotspotRuntimeContext(message = '') {
   if (!cache || !isContextFresh()) return ''
 
   const items = getCurrentHotspotItems(20)
-  if (!items.length) return ''
+  const summary = cache.situationAnalysis?.contextSummary || ''
+  if (!items.length && !summary) return ''
 
   const matches = matchHotspots(message, items)
   const persisted = []
@@ -316,13 +788,13 @@ export function buildHotspotRuntimeContext(message = '') {
   if (!shouldInjectPanelContext && !matches.length) return ''
 
   const matchText = matches.length
-    ? `\n\nThe current user message may have mentioned these recent hotspots:\n${formatHotspotLines(matches.map(m => m.item))}${persisted.length ? `\nAutomatically archived as long-term hotspot memories: ${persisted.join(', ')}` : ''}`
+    ? `\n\nThe current user message may have mentioned these recent hotspots:\n${formatHotspotLines(matches.map(m => m.item).slice(0, 3))}${persisted.length ? `\nAutomatically archived as long-term hotspot memories: ${persisted.join(', ')}` : ''}`
     : ''
 
   return `## Hotspot Context
 Source: hotspot mode UI, automatically collected by the system. Sender: SYSTEM. Purpose: provide current environment background; this is not a user request.
 
-The user recently opened the hotspot panel. The following hotspots are contextual references only. Do not proactively summarize them, do not treat them as user messages, and do not reply to the user solely because of this context.
+The user recently opened the hotspot panel. The following is a compact situation summary only; full news and hot-list items are intentionally not injected to minimize tokens. Do not proactively summarize it, do not treat it as a user message, and do not reply to the user solely because of this context.
 
 Mention hotspots proactively only when one of these is true:
 - The hotspot is directly related to the user's current question, task, or topic.
@@ -330,9 +802,9 @@ Mention hotspots proactively only when one of these is true:
 - The user explicitly asks about hotspots, trending searches, or what is happening now.
 
 Fetched at: ${formatFetchedAt(cache.fetchedAt)}${cache.stale ? ', partly cached data' : ''}
-Current hotspot panel: ${getHotspotPanelState().active ? 'open' : 'closed'}; after the panel opens, a multi-platform hotspot impression is retained for the most recent ${HOTSPOT_CONTEXT_TTL_MINUTES} minutes. Current injection scope is Top 10 per platform; automatic matching and persistence candidates use Top 20 per platform.
+Analysis cadence: every ${cache.situationAnalysis?.refreshHours || DEFAULT_ANALYSIS_REFRESH_HOURS} hours; live feed cadence: every ${cache.liveFeedMeta?.refreshMinutes || DEFAULT_NEWS_REFRESH_MINUTES} minutes; current hotspot panel: ${getHotspotPanelState().active ? 'open' : 'closed'}.
 
-${contextPlatformBlocks()}${matchText}`
+${summary || 'No compact situation summary is available yet.'}${matchText}`
 }
 
 function pickArray(data) {
@@ -367,7 +839,7 @@ function normalizeItems(platform, rawItems, source) {
         platform,
         rank: Number(item?.position || item?.rank || item?.index || idx + 1),
         title: String(title).trim(),
-        heat: formatHeat(item?.hot_value ?? item?.hotValue ?? item?.hotwordnum ?? item?.heat ?? item?.score ?? item?.views ?? item?.view_count ?? item?.num ?? ''),
+        heat: formatHeat(item?.hot_value ?? item?.hotValue ?? item?.hotwordnum ?? item?.heat ?? item?.score ?? item?.views ?? item?.view_count ?? item?.num ?? '') || tag || (platform === 'wechat' ? '热' : ''),
         tag,
         trend: 'same',
         isNew: tag === '新' || item?.is_new === true || item?.isNew === true,
@@ -377,6 +849,24 @@ function normalizeItems(platform, rawItems, source) {
     })
     .filter(Boolean)
     .slice(0, 50)
+}
+
+function normalizeAiItem(item = {}, idx, source) {
+  const title = String(item.title || item.name || item.full_name || item.text || '').trim()
+  if (!title) return null
+  const tag = item.tag || item.language || item.license?.spdx_id || ''
+  const stars = Number(item.stargazers_count || item.stars || 0)
+  return {
+    platform: 'ai',
+    rank: idx + 1,
+    title,
+    heat: stars ? `${stars.toLocaleString('zh-CN')}★` : (tag || 'AI'),
+    tag,
+    trend: 'same',
+    isNew: !!item.isNew,
+    url: item.html_url || item.url || item.link || '',
+    source,
+  }
 }
 
 async function fetchCustomPlatform(platform, url) {
@@ -427,6 +917,67 @@ async function fetchHotData(platform, dataId, key) {
   const items = normalizeItems(platform, pickArray(data), 'hotdata')
   if (!items.length) throw new Error('Hot Data 返回空热榜')
   return items
+}
+
+async function fetchGithubAiHotspots() {
+  const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+  const query = encodeURIComponent(`created:>${since} is:public archived:false AI OR LLM OR agent`)
+  const data = await fetchJson(`https://api.github.com/search/repositories?q=${query}&sort=stars&order=desc&per_page=12`, {
+    headers: { Accept: 'application/vnd.github+json' },
+  })
+  const items = (data?.items || [])
+    .map((repo, idx) => normalizeAiItem({
+      title: repo.full_name,
+      stargazers_count: repo.stargazers_count,
+      language: repo.language || repo.license?.spdx_id || 'GitHub',
+      html_url: repo.html_url,
+      isNew: idx < 3,
+    }, idx, 'github-search'))
+    .filter(Boolean)
+  if (!items.length) throw new Error('GitHub AI 热点返回空数据')
+  return items
+}
+
+async function fetchHackerNewsAiHotspots() {
+  const ids = await fetchJson('https://hacker-news.firebaseio.com/v0/topstories.json', { timeoutMs: 8000 })
+  const topIds = Array.isArray(ids) ? ids.slice(0, 40) : []
+  if (!topIds.length) throw new Error('Hacker News topstories 返回空数据')
+  const stories = await Promise.allSettled(topIds.map(id =>
+    fetchJson(`https://hacker-news.firebaseio.com/v0/item/${id}.json`, { timeoutMs: 5000 })
+  ))
+  const aiRe = /\b(ai|artificial intelligence|llm|agent|openai|anthropic|deepseek|model|neural|machine learning|ml)\b/i
+  const items = stories
+    .map(result => result.status === 'fulfilled' ? result.value : null)
+    .filter(story => story?.title && aiRe.test(story.title))
+    .slice(0, 12)
+    .map((story, idx) => normalizeAiItem({
+      title: story.title,
+      stars: story.score,
+      tag: 'HN',
+      url: story.url || `https://news.ycombinator.com/item?id=${story.id}`,
+      isNew: idx < 2,
+    }, idx, 'hackernews'))
+    .filter(Boolean)
+  if (!items.length) throw new Error('Hacker News 暂无 AI 热点')
+  return items
+}
+
+function fetchFallbackAiTopics() {
+  return AI_TOPIC_QUERIES.map((topic, idx) => normalizeAiItem({
+    title: topic.title,
+    tag: topic.tag,
+    isNew: idx < 2,
+    url: `https://github.com/search?q=${encodeURIComponent(topic.title)}&type=repositories&s=stars&o=desc`,
+  }, idx, 'fallback-ai-topics')).filter(Boolean)
+}
+
+async function fetchAiHotspots() {
+  const providers = [
+    fetchGithubAiHotspots,
+    fetchHackerNewsAiHotspots,
+    () => Promise.resolve(fetchFallbackAiTopics()),
+  ]
+  return runProviders(providers, 'AI人工智能热点源不可用')
 }
 
 async function fetchDouyin(config) {
@@ -490,11 +1041,15 @@ async function fetchPlatform(platform, loader) {
 async function fetchHotspots() {
   const config = readHotspotConfig()
   const fetchedAt = new Date()
-  const results = await Promise.all([
-    fetchPlatform('douyin', () => fetchDouyin(config)),
-    fetchPlatform('xiaohongshu', () => fetchXiaohongshu(config)),
-    fetchPlatform('wechat', () => fetchWechat(config)),
-    fetchPlatform('weibo', () => fetchWeibo(config)),
+  const [results, liveFeed] = await Promise.all([
+    Promise.all([
+      fetchPlatform('ai', fetchAiHotspots),
+      fetchPlatform('douyin', () => fetchDouyin(config)),
+      fetchPlatform('xiaohongshu', () => fetchXiaohongshu(config)),
+      fetchPlatform('wechat', () => fetchWechat(config)),
+      fetchPlatform('weibo', () => fetchWeibo(config)),
+    ]),
+    getLiveFeed(config),
   ])
 
   const platforms = {}
@@ -510,12 +1065,27 @@ async function fetchHotspots() {
     throw new Error(errors || '全部热点源均不可用')
   }
 
+  const situationAnalysis = await getSituationAnalysis(platforms, liveFeed.items || [], config)
+
   return {
     ok: true,
     refreshMinutes: config.refreshMinutes,
+    newsRefreshMinutes: config.newsRefreshMinutes,
+    analysisRefreshHours: config.analysisRefreshHours,
     fetchedAt: fetchedAt.toISOString(),
     fetchedAtMs: fetchedAt.getTime(),
     stale: false,
+    liveFeed: liveFeed.items || [],
+    liveFeedMeta: {
+      ok: liveFeed.ok !== false,
+      fetchedAt: liveFeed.fetchedAt,
+      fetchedAtMs: liveFeed.fetchedAtMs,
+      refreshMinutes: liveFeed.refreshMinutes || config.newsRefreshMinutes,
+      stale: !!liveFeed.stale,
+      error: liveFeed.error,
+      status: liveFeed.status || [],
+    },
+    situationAnalysis,
     platforms,
     status,
   }
@@ -523,7 +1093,28 @@ async function fetchHotspots() {
 
 export async function getHotspots({ force = false, viewed = false } = {}) {
   if (viewed) noteHotspotPanelViewed()
-  if (!force && isCacheFresh()) return cache
+  const config = readHotspotConfig()
+  if (!force && isCacheFresh()) {
+    const liveFeed = await getLiveFeed(config)
+    const situationAnalysis = await getSituationAnalysis(cache.platforms || {}, liveFeed.items || [], config)
+    cache = {
+      ...cache,
+      newsRefreshMinutes: config.newsRefreshMinutes,
+      analysisRefreshHours: config.analysisRefreshHours,
+      liveFeed: liveFeed.items || [],
+      liveFeedMeta: {
+        ok: liveFeed.ok !== false,
+        fetchedAt: liveFeed.fetchedAt,
+        fetchedAtMs: liveFeed.fetchedAtMs,
+        refreshMinutes: liveFeed.refreshMinutes || config.newsRefreshMinutes,
+        stale: !!liveFeed.stale,
+        error: liveFeed.error,
+        status: liveFeed.status || [],
+      },
+      situationAnalysis,
+    }
+    return cache
+  }
   if (inFlight) return inFlight
 
   inFlight = fetchHotspots()

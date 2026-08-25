@@ -15,6 +15,7 @@ export function initChat({
   apiBase,
   maxHistory,
   activationWarmupKey,
+  clientId = "",
   getAgentName,
   defaultInputPlaceholder,
   onUserMessage = null,
@@ -238,22 +239,24 @@ export function initChat({
   // text 显式传入时直接发送、不经过输入框（语音识别用：voice 完全不在 msg-input 留草稿）；
   // 不传 text 则保持原行为，从输入框读取并清空。
   async function send({ channel = null, label = null, text = null } = {}) {
-    if (inputLocked) return;
     const fromInput = (text == null);
+    if (inputLocked && fromInput) return false;
     const content = (fromInput ? msgInput.value : text).trim();
-    if (!content) return;
+    if (!content) return false;
     if (fromInput) { msgInput.value = ""; autoGrowInput(); }
     // If onUserMessage returns a string, use it as the backend payload; if it returns false, skip the backend call
     const override = onUserMessage?.(content);
     addMsg("user", content, { label: label || undefined });
     openChat();
     scheduleClose(1000);
-    if (override === false) return;
+    if (override === false) return true;
 
     try {
       const backendText = (typeof override === "string") ? override : content;
       const payload = { content: backendText, from_id: "ID:000001" };
       if (channel) payload.channel = channel;
+      if (clientId) payload.client_id = clientId;
+      console.log(`[chat-send] channel=${channel || 'default'} label=${label || ''} text=${backendText.slice(0, 80)}`);
       const resp = await fetch(`${apiBase}/message`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -267,10 +270,12 @@ export function initChat({
         } catch {}
         throw new Error(message);
       }
+      return true;
     } catch (error) {
       console.warn("[send]", error.message);
       addMsg("jarvis", "发送失败 — 请检查本地服务是否运行。");
       openChat(true);
+      return false;
     }
   }
 

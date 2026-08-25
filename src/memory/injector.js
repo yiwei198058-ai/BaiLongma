@@ -51,6 +51,48 @@ export { formatActivePoliciesForPrompt } from './active-policies.js'
 
 const L2_CONTEXT_HOURS = 24 * 7
 
+const PREFETCH_NEWS_RE = /新闻|资讯|热点|热搜|日报|周报|月报|公众号|素材|选题|采集|整理|报告|trending|hacker\s*news|\bhn\b|rss/i
+const PREFETCH_AI_RE = /\bai\b|人工智能|大模型|模型|机器学习|深度学习|\bllm\b|agent|openai|anthropic|deepseek|hugging\s*face|arxiv|github|量子位|机器之心|新智元/i
+const PREFETCH_WEATHER_RE = /天气|气温|温度|下雨|降雨|降雪|风速|北京|陆丰|beijing|lufeng/i
+
+function parsePrefetchTags(item) {
+  try {
+    const tags = JSON.parse(item?.tags || '[]')
+    return Array.isArray(tags) ? tags : []
+  } catch {
+    return []
+  }
+}
+
+function filterPrefetchedItemsForIntent(items = [], { messageBody = '', task = '', hint = '', isTick = false } = {}) {
+  if (!items?.length) return []
+  const intentText = [messageBody, task, hint].filter(Boolean).join(' ')
+  if (!intentText.trim()) return []
+
+  const wantsNews = PREFETCH_NEWS_RE.test(intentText)
+  const wantsAi = PREFETCH_AI_RE.test(intentText)
+  const wantsWeather = PREFETCH_WEATHER_RE.test(intentText)
+
+  // 空闲 TICK 不带预抓缓存，避免后台心跳把缓存内容反复塞进上下文。
+  if (isTick && !task && !wantsNews && !wantsWeather) return []
+
+  return items.filter(item => {
+    const source = String(item?.source || '')
+    const tags = parsePrefetchTags(item).join(' ')
+    const haystack = `${source} ${tags}`
+
+    if (source === 'news:ai-digest') return wantsNews && wantsAi
+    if (source.startsWith('weather:')) return wantsWeather
+    if (source.startsWith('news:')) return wantsNews && (wantsAi || !PREFETCH_AI_RE.test(haystack))
+
+    // DB 动态任务按标签/来源轻量匹配，避免所有缓存默认注入。
+    return intentText
+      .split(/\s+|，|。|、|：|:|,|\./)
+      .filter(part => part && part.length >= 2)
+      .some(part => haystack.toLowerCase().includes(part.toLowerCase()))
+  }).slice(0, 3)
+}
+
 // hint：一层思考器的输出文本，用于扩展 L2 的记忆检索范围
 export async function runInjector({ message, state, hint = '' }) {
   const injectorStartedAt = Date.now()
@@ -186,7 +228,13 @@ export async function runInjector({ message, state, hint = '' }) {
   // —— 按需注入工具（动态上下文记忆池第 4 步）——
   // 之前把 ~35 个工具全量注入，每轮 6-9K token 大头在这。改成按意图分组：
   // tool-router.js 看消息正文 + 上下文标志 + ActionLog 保活 + Fallback 安全网。
-  const prefetchedItems = getValidPrefetchCache()
+  const isTick = !senderId && /^TICK\s/i.test(message?.trim())
+  const prefetchedItems = filterPrefetchedItemsForIntent(getValidPrefetchCache(), {
+    messageBody,
+    task: state?.task || '',
+    hint: hintText,
+    isTick,
+  })
 
   const uiSignals = getUnconsumedUISignals(60_000)
   const uiSignalSummary = summarizeUISignals(uiSignals)
@@ -197,8 +245,6 @@ export async function runInjector({ message, state, hint = '' }) {
   const { listCapabilities } = await import('../providers/registry.js')
   const mmCaps = listCapabilities()
   const installedNames = getInstalledToolNames()
-  const isTick = !senderId && /^TICK\s/i.test(message?.trim())
-
   const tools = selectTools({
     messageBody,
     isTick,

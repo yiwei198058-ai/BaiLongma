@@ -3,6 +3,74 @@ import { createWorldcupPanel } from './worldcup-panel.js';
 import { createPersonCardPanel } from './person-card-panel.js';
 import { createDocPanel } from './doc-panel.js';
 
+const createLoginScreen = () => `
+<section class="login-screen" id="login-screen" aria-label="BaiLongma 登录">
+  <div class="login-bg-grid"></div>
+  <div class="login-shell">
+    <div class="login-brand-panel" aria-hidden="true">
+      <div class="login-brand-lockup">
+        <div class="login-brand-orb"></div>
+        <div>
+          <div class="login-kicker">BaiLongma</div>
+          <div class="login-brand-name">小白龙</div>
+        </div>
+      </div>
+      <div class="login-signal-board">
+        <div class="login-signal-row">
+          <span>CORE</span>
+          <strong>Online</strong>
+        </div>
+        <div class="login-signal-row">
+          <span>VOICE</span>
+          <strong>Ready</strong>
+        </div>
+        <div class="login-signal-row">
+          <span>MODEL</span>
+          <strong>Activated</strong>
+        </div>
+      </div>
+    </div>
+
+    <form class="login-card" id="login-form">
+      <div class="login-card-head">
+        <div class="brand-mark login-card-mark"></div>
+        <div>
+          <div class="login-title" id="login-title">登录 BaiLongma</div>
+          <div class="login-subtitle" id="login-subtitle">进入本地智能体工作台</div>
+        </div>
+      </div>
+
+      <label class="login-field" for="login-account">
+        <span id="login-account-label">账号 / 手机号</span>
+        <input id="login-account" name="account" type="text" inputmode="text" autocomplete="username" placeholder="请输入账号或手机号">
+      </label>
+
+      <label class="login-field" id="login-phone-field" for="login-phone" hidden>
+        <span>手机号</span>
+        <input id="login-phone" name="phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="请输入手机号">
+      </label>
+
+      <label class="login-field" for="login-password">
+        <span>密码</span>
+        <input id="login-password" name="password" type="password" autocomplete="current-password" placeholder="请输入密码">
+      </label>
+
+      <div class="login-row">
+        <label class="login-check">
+          <input id="login-remember" type="checkbox">
+          <span>记住登录</span>
+        </label>
+        <button class="login-link" id="login-activate" type="button">API Key / 激活</button>
+      </div>
+
+      <button class="login-submit" type="submit">登录</button>
+      <button class="login-skip" id="login-skip" type="button" hidden>预览进入</button>
+      <div class="login-feedback" id="login-feedback" aria-live="polite"></div>
+    </form>
+  </div>
+</section>
+`;
+
 const createGraphStage = () => `
 <div class="grid-overlay"></div>
 <svg id="graph" aria-label="Longma 记忆节点图"></svg>
@@ -251,7 +319,7 @@ const createSettingsModal = () => `
             <div class="settings-row">
               <label class="settings-label" for="settings-llm-key">API Key</label>
               <div class="settings-secret-wrap">
-                <input class="settings-input" id="settings-llm-key" type="password" placeholder="已保存的 Key 会在这里显示" autocomplete="new-password">
+                <input class="settings-input" id="settings-llm-key" type="password" placeholder="已配置时留空即可保持不变" autocomplete="new-password">
                 <button class="settings-secret-toggle" id="settings-llm-key-toggle" type="button" aria-label="显示 API Key" title="显示/隐藏 API Key">👁</button>
               </div>
             </div>
@@ -391,7 +459,7 @@ const createSettingsModal = () => `
             <div class="settings-section-label">识别模式配置</div>
             <div class="settings-row">
               <label class="settings-label" for="voice-auto-key">粘贴 Key 自动识别厂商</label>
-              <input class="settings-input" type="password" id="voice-auto-key" placeholder="阿里云 / 腾讯云 / 讯飞 / 火山豆包 ASR Key">
+              <input class="settings-input" type="password" id="voice-auto-key" placeholder="阿里云 / 百度 / 腾讯云 / 讯飞 / 火山豆包 ASR Key">
               <span id="voice-auto-detect" style="color:var(--cool);font-size:12px;min-width:86px;text-align:right;"></span>
             </div>
             <div class="settings-row">
@@ -399,6 +467,7 @@ const createSettingsModal = () => `
               <select class="settings-select" id="voice-provider-select">
                 <option value="local">本机识别（macOS）</option>
                 <option value="aliyun">阿里云百炼（推荐）</option>
+                <option value="baidu">百度语音识别</option>
                 <option value="volcengine">火山引擎豆包 ASR</option>
                 <option value="tencent">腾讯云 ASR</option>
                 <option value="xunfei">科大讯飞 RTASR</option>
@@ -409,6 +478,36 @@ const createSettingsModal = () => `
                 <label class="settings-label" for="voice-aliyun-key">阿里云 API Key</label>
                 <input class="settings-input" type="password" id="voice-aliyun-key" placeholder="留空则不修改">
               </div>
+            </div>
+            <div id="voice-cred-baidu" style="display:none;">
+              <div class="settings-row">
+                <label class="settings-label" for="voice-baidu-mode">识别接口</label>
+                <select class="settings-select" id="voice-baidu-mode">
+                  <option value="rest">短语音 REST（推荐，API Key + Secret Key）</option>
+                  <option value="realtime">实时 WebSocket（需额外开通实时识别权限）</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label class="settings-label" for="voice-baidu-appid">AppID</label>
+                <input class="settings-input" type="text" id="voice-baidu-appid" placeholder="实时 WebSocket 必填；REST 可不填">
+              </div>
+              <div class="settings-row">
+                <label class="settings-label" for="voice-baidu-apikey">API Key</label>
+                <input class="settings-input" type="password" id="voice-baidu-apikey" placeholder="留空则不修改">
+              </div>
+              <div class="settings-row">
+                <label class="settings-label" for="voice-baidu-secretkey">Secret Key</label>
+                <input class="settings-input" type="password" id="voice-baidu-secretkey" placeholder="REST 短语音必填，留空则不修改">
+              </div>
+              <div class="settings-row">
+                <label class="settings-label" for="voice-baidu-devpid">Dev PID</label>
+                <input class="settings-input" type="text" id="voice-baidu-devpid" placeholder="REST 默认 1537；实时默认 15372">
+              </div>
+              <div class="settings-row">
+                <label class="settings-label" for="voice-baidu-cuid">CUID</label>
+                <input class="settings-input" type="text" id="voice-baidu-cuid" placeholder="可空，默认 bailongma">
+              </div>
+              <p class="settings-hint">普通百度语音识别用短语音 REST：填写 API Key + Secret Key。实时 WebSocket 需要控制台额外开通实时识别权限，否则会返回 -3004 No permission。</p>
             </div>
             <div id="voice-cred-tencent" style="display:none;">
               <div class="settings-row">
@@ -493,7 +592,7 @@ const createSettingsModal = () => `
 
           <div class="settings-section" id="settings-tts-section">
             <div class="settings-section-label">语音合成（TTS）</div>
-            <p class="settings-hint">用语音发消息时，Agent 回复会自动转为语音播放。首选推荐豆包语音合成 2.0（https://console.volcengine.com/speech/new/），也支持 MiniMax、OpenAI、ElevenLabs、火山引擎。</p>
+            <p class="settings-hint">用语音发消息时，Agent 回复会自动转为语音播放。首选推荐豆包语音合成 2.0（https://console.volcengine.com/speech/new/），也支持百度智能云、MiniMax、OpenAI、ElevenLabs、火山引擎。</p>
             <div class="settings-row">
               <label class="settings-label" for="voice-output-select">输出设备</label>
               <select class="settings-select" id="voice-output-select">
@@ -506,6 +605,7 @@ const createSettingsModal = () => `
               <label class="settings-label" for="tts-provider-select">服务商</label>
               <select class="settings-select" id="tts-provider-select">
                 <option value="doubao">豆包（方舟，流式，中文最自然）</option>
+                <option value="baidu">百度智能云（中文，需 API Key + Secret Key）</option>
                 <option value="openai">OpenAI TTS（流式，$0.015/千字）</option>
                 <option value="elevenlabs">ElevenLabs（流式，高质量）</option>
                 <option value="volcano">火山引擎（中文，有免费额度）</option>
@@ -581,6 +681,37 @@ const createSettingsModal = () => `
                 <span id="tts-doubao-rate-val"></span>
               </div>
               <p class="settings-hint">在<a href="https://console.volcengine.com/speech/new/" target="_blank" style="color:var(--cool)">豆包语音合成控制台</a>获取 API Key。2.0 音色使用 seed-tts-2.0；1.0/moon/BV 音色使用 seed-tts-1.0 或控制台对应资源。<br>「情感风格」用自然语言描述语气（越具体越好，短词无效），留空＝中性。要贾维斯感建议配男声（云舟 zh_male_m191_uranus_bigtts）。</p>
+            </div>
+
+            <div id="tts-creds-baidu" style="display:none;">
+              <div class="settings-row">
+                <label class="settings-label" for="tts-baidu-api-key">API Key</label>
+                <input class="settings-input" type="password" id="tts-baidu-api-key" placeholder="留空则不修改">
+              </div>
+              <div class="settings-row">
+                <label class="settings-label" for="tts-baidu-secret-key">Secret Key</label>
+                <input class="settings-input" type="password" id="tts-baidu-secret-key" placeholder="留空则不修改">
+              </div>
+              <div class="settings-row">
+                <label class="settings-label" for="tts-baidu-cuid">CUID</label>
+                <input class="settings-input" type="text" id="tts-baidu-cuid" placeholder="可空，默认 bailongma">
+              </div>
+              <div class="tts-fx-srow">
+                <label for="tts-baidu-speed">语速</label>
+                <input type="range" id="tts-baidu-speed" min="0" max="15" step="1">
+                <span id="tts-baidu-speed-val"></span>
+              </div>
+              <div class="tts-fx-srow">
+                <label for="tts-baidu-pitch">音调</label>
+                <input type="range" id="tts-baidu-pitch" min="0" max="15" step="1">
+                <span id="tts-baidu-pitch-val"></span>
+              </div>
+              <div class="tts-fx-srow" style="margin-bottom:8px;">
+                <label for="tts-baidu-volume">音量</label>
+                <input type="range" id="tts-baidu-volume" min="0" max="15" step="1">
+                <span id="tts-baidu-volume-val"></span>
+              </div>
+              <p class="settings-hint">在百度智能云「语音技术」应用中获取 API Key 和 Secret Key。短文本合成使用在线 REST 接口，返回 MP3。</p>
             </div>
 
             <div id="tts-creds-minimax" style="display:none;">
@@ -958,6 +1089,7 @@ const createPanelTabs = () => `
 
 export function createBrainUiMarkup() {
   return [
+    createLoginScreen(),
     createGraphStage(),
     createPrimaryPanel(),
     createSecondaryPanel(),

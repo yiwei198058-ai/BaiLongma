@@ -82,11 +82,37 @@ export function formatMemoriesForPrompt(memories, recallMemories = []) {
 }
 
 // 预热缓存：格式化注入文本
+function compactPrefetchContent(item) {
+  const source = String(item?.source || '')
+  const content = String(item?.content || '').trim()
+  if (!content) return ''
+
+  if (source === 'news:ai-digest') {
+    const fileLine = content.split('\n').find(line => line.startsWith('完整文件：')) || ''
+    const lines = content
+      .split('\n')
+      .filter(line => {
+        const trimmed = line.trim()
+        if (!trimmed) return true
+        return trimmed.startsWith('#') ||
+          trimmed.startsWith('抓取时间：') ||
+          trimmed.startsWith('完整文件：') ||
+          trimmed.startsWith('说明：') ||
+          /^\d+\.\s/.test(trimmed)
+      })
+      .slice(0, 28)
+    if (fileLine && !lines.includes(fileLine)) lines.splice(2, 0, fileLine)
+    return lines.join('\n').slice(0, 2600)
+  }
+
+  return content.slice(0, 1200)
+}
+
 export function formatPrefetchedItems(prefetchedItems = []) {
   if (!prefetchedItems?.length) return ''
   const body = prefetchedItems.map(item => {
     const fetchedTime = item.fetched_at?.slice(11, 16) || ''
-    return `[${item.source}] (${fetchedTime} already fetched)\n${item.content}`
+    return `[${item.source}] (${fetchedTime} already fetched)\n${compactPrefetchContent(item)}`
   }).join('\n\n')
   return body + '\n\nThe data above has already been prefetched. Use it directly and phrase the response naturally; do not reuse the same sentence pattern every time.'
 }

@@ -7,6 +7,7 @@
 //   tencent — 腾讯云 ASR
 //   xunfei  — 科大讯飞 RTASR
 //   volcengine — 火山引擎豆包大模型流式 ASR
+//   baidu — 百度实时语音识别 WebSocket
 
 import crypto from 'crypto'
 import zlib from 'zlib'
@@ -109,6 +110,227 @@ function createAliyunSession(apiKey, lang, onTranscript, onError, onClose, onEve
 
 function isValidAliyunAsrKey(value) {
   return /^sk-[A-Za-z0-9_\-.]{20,}$/.test(String(value || '').trim())
+}
+
+let baiduAsrTokenCache = { key: '', token: '', expiresAt: 0 }
+
+async function getBaiduAsrAccessToken(apiKey, secretKey) {
+  const cacheKey = `${apiKey}:${secretKey}`
+  const now = Date.now()
+  if (baiduAsrTokenCache.key === cacheKey && baiduAsrTokenCache.token && baiduAsrTokenCache.expiresAt > now + 60_000) {
+    return baiduAsrTokenCache.token
+  }
+  const params = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: apiKey,
+    client_secret: secretKey,
+  })
+  const resp = await fetch('https://aip.baidubce.com/oauth/2.0/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params,
+  })
+  const data = await resp.json().catch(() => ({}))
+  if (!resp.ok || !data?.access_token) {
+    throw new Error(`百度 ASR: 获取 access_token 失败 (${resp.status}): ${JSON.stringify(data).slice(0, 300)}`)
+  }
+  const expiresIn = Number(data.expires_in || 0)
+  baiduAsrTokenCache = {
+    key: cacheKey,
+    token: data.access_token,
+    expiresAt: now + Math.max(60, expiresIn - 300) * 1000,
+  }
+  return data.access_token
+}
+
+function resolveBaiduRestDevPid(lang, devPid) {
+  const n = Number(devPid)
+  if (Number.isFinite(n) && n > 0) {
+    const realtimeToRest = {
+      15372: 1537,
+      17372: 1737,
+      16372: 1637,
+      18372: 1837,
+    }
+    return realtimeToRest[n] || n
+  }
+  return lang === 'en' || lang === 'en-US' ? 1737 : 1537
+}
+
+async function recognizeBaiduRest({ audio, config, lang }) {
+  const token = await getBaiduAsrAccessToken(config.baiduAsrApiKey, config.baiduAsrSecretKey)
+  const devPid = resolveBaiduRestDevPid(lang, config.baiduAsrDevPid)
+  const body = {
+    format: 'pcm',
+    rate: 16000,
+    channel: 1,
+    cuid: config.baiduAsrCuid || 'bailongma',
+    token,
+    dev_pid: devPid,
+    speech: audio.toString('base64'),
+    len: audio.length,
+  }
+  const resp = await fetch('https://vop.baidu.com/server_api', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const data = await resp.json().catch(() => ({}))
+  console.log(`[ASR] baidu rest response status=${resp.status} err_no=${data.err_no ?? ''} len=${audio.length} dev_pid=${devPid} result_len=${Array.isArray(data.result) ? data.result.join('').length : 0}`)
+  if (!resp.ok || Number(data.err_no) !== 0) {
+    if ([3301, 3307].includes(Number(data.err_no))) {
+      console.log(`[ASR] baidu rest no-speech err_no=${data.err_no} msg=${data.err_msg || ''}`)
+      return ''
+    }
+    throw new Error(`百度 ASR 错误 ${data.err_no ?? resp.status}: ${data.err_msg || JSON.stringify(data).slice(0, 200)}`)
+  }
+  const text = Array.isArray(data.result) ? data.result.join('') : String(data.result || '')
+  return text.trim()
+}
+
+function isBaiduRestNoiseTranscript(text) {
+  const normalized = String(text || '')
+    .trim()
+    .replace(/[。！？!?，,、.\s]/g, '')
+  // 常开麦克风下百度短语音很容易把底噪/呼吸/回声识别成单个语气词。
+  // 这些不是可执行语音指令，直接丢弃，避免进入对话后再触发 TTS。
+  return normalized.length <= 4 && /^[哦噢喔啊嗯呃额诶唉哎呀哈呵]+$/.test(normalized)
+}
+
+// 百度短语音 REST 不是无限流式接口，PCM 太长会返回 3310。
+// 16k/16-bit/mono 约 32KB/s；保留最近 25s 足够覆盖普通语音轮，同时给接口留安全余量。
+const BAIDU_REST_MAX_AUDIO_BYTES = 800_000
+
+function createBaiduRestSession(config, lang, onTranscript, onError, onClose) {
+  const chunks = []
+  let bufferedBytes = 0
+  let closed = false
+  let flushing = false
+  return {
+    sendAudio(pcmBuffer) {
+      if (closed || flushing || !pcmBuffer?.length) return
+      const chunk = Buffer.from(pcmBuffer)
+      chunks.push(chunk)
+      bufferedBytes += chunk.length
+      while (bufferedBytes > BAIDU_REST_MAX_AUDIO_BYTES && chunks.length > 1) {
+        const dropped = chunks.shift()
+        bufferedBytes -= dropped?.length || 0
+      }
+    },
+    async flush() {
+      if (closed || flushing) return
+      flushing = true
+      try {
+        const audio = Buffer.concat(chunks)
+        chunks.length = 0
+        bufferedBytes = 0
+        if (!audio.length) return
+        console.log(`[ASR] baidu rest flush bytes=${audio.length}`)
+        const text = await recognizeBaiduRest({ audio, config, lang })
+        if (isBaiduRestNoiseTranscript(text)) {
+          console.log(`[ASR] baidu rest noise ignored text=${text}`)
+          return
+        }
+        if (text) onTranscript(text, true, 'brest')
+        if (!closed) setTimeout(() => { if (!closed) this.close() }, 120)
+      } catch (err) {
+        onError(err.message || String(err))
+      } finally {
+        flushing = false
+      }
+    },
+    close() {
+      chunks.length = 0
+      bufferedBytes = 0
+      closed = true
+      onClose()
+    },
+  }
+}
+
+// ─── 百度实时语音识别 WebSocket ───
+// 协议：START JSON → PCM binary chunks → FINISH JSON
+// 文档：https://ai.baidu.com/ai-doc/SPEECH/jlbxejt2i
+function resolveBaiduDevPid(lang, devPid) {
+  const n = Number(devPid)
+  if (Number.isFinite(n) && n > 0) return n
+  return lang === 'en' || lang === 'en-US' ? 17372 : 15372
+}
+
+function createBaiduSession(config, lang, onTranscript, onError, onClose) {
+  const sn = crypto.randomUUID()
+  const ws = new WebSocket(`wss://vop.baidu.com/realtime_asr?sn=${encodeURIComponent(sn)}`)
+  let ready = false
+  let closed = false
+  let currentSeg = 'b0'
+  let segCounter = 0
+  const pending = []
+
+  ws.on('open', () => {
+    const devPid = resolveBaiduDevPid(lang, config.baiduAsrDevPid)
+    const startData = {
+      appid: Number(config.baiduAsrAppId) || config.baiduAsrAppId,
+      appkey: config.baiduAsrApiKey,
+      dev_pid: devPid,
+      cuid: config.baiduAsrCuid || 'bailongma',
+      format: 'pcm',
+      sample: 16000,
+    }
+    if (config.baiduAsrLmId) startData.lm_id = Number(config.baiduAsrLmId) || config.baiduAsrLmId
+    if (devPid === 15376) startData.user = config.baiduAsrUser || 'bailongma'
+    try { ws.send(JSON.stringify({ type: 'START', data: startData })) } catch {}
+    ready = true
+    for (const buf of pending) {
+      try { ws.send(buf) } catch {}
+    }
+    pending.length = 0
+  })
+
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString())
+      if (msg.type === 'HEARTBEAT') return
+      const isFinal = msg.type === 'FIN_TEXT'
+      if (msg.err_no && msg.err_no !== 0) {
+        onError(`百度 ASR 错误 ${msg.err_no}: ${msg.err_msg || '未知错误'}`)
+        return
+      }
+      const text = String(msg.result || '').trim()
+      if (!text) return
+      if (isFinal) {
+        const seg = msg.start_time != null ? `b${msg.start_time}` : currentSeg
+        onTranscript(text, true, seg)
+        currentSeg = `b${++segCounter}`
+      } else {
+        onTranscript(text, false, currentSeg)
+      }
+    } catch {}
+  })
+
+  ws.on('error', (err) => { pending.length = 0; onError(err.message) })
+  ws.on('close', () => { pending.length = 0; closed = true; onClose() })
+
+  return {
+    sendAudio(pcmBuffer) {
+      if (closed) return
+      if (!ready) {
+        if (pending.length < MAX_PENDING_CHUNKS) pending.push(Buffer.from(pcmBuffer))
+        return
+      }
+      if (ws.readyState === WebSocket.OPEN) ws.send(pcmBuffer)
+    },
+    flush() {
+      if (ws.readyState !== WebSocket.OPEN) return
+      ws.send(JSON.stringify({ type: 'FINISH' }))
+    },
+    close() {
+      try {
+        closed = true
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'CANCEL' }))
+        ws.close()
+      } catch {}
+    },
+  }
 }
 
 // ─── 腾讯云 ASR ───
@@ -436,7 +658,9 @@ function createVolcengineSession(config, lang, onTranscript, onError, onClose) {
 }
 
 // ─── 工厂函数 ───
-// config: { provider, lang, aliyunApiKey?, tencentSecretId?, tencentSecretKey?,
+// config: { provider, lang, aliyunApiKey?, baiduAsrAppId?, baiduAsrApiKey?,
+//           baiduAsrDevPid?, baiduAsrCuid?, baiduAsrLmId?, baiduAsrUser?,
+//           tencentSecretId?, tencentSecretKey?,
 //           tencentAppId?, xunfeiAppId?, xunfeiApiKey?,
 //           volcAsrApiKey?, volcAsrAppKey?, volcAsrAccessKey?, volcAsrResourceId? }
 export function createCloudASRSession(config, onTranscript, onError, onClose, onEvent) {
@@ -457,6 +681,22 @@ export function createCloudASRSession(config, onTranscript, onError, onClose, on
       return null
     }
     return createAliyunSession(config.aliyunApiKey, lang, onTranscript, onError, onClose, onEvent)
+  }
+
+  if (provider === 'baidu') {
+    const mode = String(config.baiduAsrMode || 'rest').trim().toLowerCase()
+    if (mode === 'realtime') {
+      if (!config.baiduAsrAppId || !config.baiduAsrApiKey) {
+        onError('未配置百度实时 ASR AppID/API Key')
+        return null
+      }
+      return createBaiduSession(config, lang, onTranscript, onError, onClose)
+    }
+    if (!config.baiduAsrApiKey || !config.baiduAsrSecretKey) {
+      onError('未配置百度 ASR API Key/Secret Key')
+      return null
+    }
+    return createBaiduRestSession(config, lang, onTranscript, onError, onClose)
   }
 
   if (provider === 'tencent') {

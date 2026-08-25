@@ -90,11 +90,13 @@ export function createPttController(core, { toggleVoice, cancelAutoSend }) {
       }
     };
 
-    // 给云端 800ms 把最终结果吐出来
+    // Baidu short-speech REST is not streaming; it only returns text after
+    // flush finishes the HTTP recognition request, so give it a longer window.
+    const maxWaitMs = core.isBaiduRestMode?.() ? 8000 : 800;
     let waited = 0;
     const tick = () => {
       if (core.getText()) { finalize(); return; }
-      if (waited >= 800) { finalize(); return; }
+      if (waited >= maxWaitMs) { finalize(); return; }
       waited += 100;
       setTimeout(tick, 100);
     };

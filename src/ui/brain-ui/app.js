@@ -12,6 +12,27 @@ import { initDocPanel, setDocPanelMode } from "./doc.js";
 import { initWechatPopup, showWechatPopup } from "./wechat-popup.js";
 import { attachJarvisAudioGraph, attachJarvisFx, isFxEnabledForVoice, setFxEnabledForVoice, getJarvisFxParams, setJarvisFxParams, resetJarvisFxParams, isFxUnlocked, tryUnlockFx } from "./tts-fx.js";
 import { initAudioOutputRouting, applyOutputSink, listOutputDevices, getOutputPreference, setOutputPreference } from "./audio-output.js";
+
+const ttsLog = (...args) => {
+  try { console.log("[TTS:UI]", ...args); } catch {}
+};
+
+const BLM_CLIENT_ID_KEY = "bailongma-brain-client-id";
+function createBrainClientId() {
+  try {
+    const existing = sessionStorage.getItem(BLM_CLIENT_ID_KEY);
+    if (existing) return existing;
+    const bytes = new Uint8Array(8);
+    crypto.getRandomValues(bytes);
+    const id = "brain-" + Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+    sessionStorage.setItem(BLM_CLIENT_ID_KEY, id);
+    return id;
+  } catch {
+    return "brain-" + Math.random().toString(36).slice(2, 12) + Date.now().toString(36);
+  }
+}
+const BLM_CLIENT_ID = createBrainClientId();
+
 renderBrainUiApp(document.body);
 const THEME_KEY = "jarvis-brain-ui-theme";
 const PHYSICS_STORAGE_KEY = "jarvis-brain-ui-physics";
@@ -49,8 +70,153 @@ const SUPPRESS_UPDATES_KEY = "bailongma_suppress_update_notifications";
 let agentName = DEFAULT_AGENT_NAME;
 let currentUiZoom = DEFAULT_UI_ZOOM;
 let chat = null;
+let linkData = [];
+let nodeData = [];
+let linkSel = null;
+let nodeSel = null;
 // 由 initSettings() 内部赋值，供 chat.js 的斜杠命令打开设置面板
 let openSettingsRef = null;
+
+function initLoginScreen() {
+  const loginScreen = document.getElementById("login-screen");
+  const loginForm = document.getElementById("login-form");
+  const loginSkip = document.getElementById("login-skip");
+  const loginActivate = document.getElementById("login-activate");
+  const remember = document.getElementById("login-remember");
+  const account = document.getElementById("login-account");
+  const phone = document.getElementById("login-phone");
+  const phoneField = document.getElementById("login-phone-field");
+  const password = document.getElementById("login-password");
+  const title = document.getElementById("login-title");
+  const subtitle = document.getElementById("login-subtitle");
+  const accountLabel = document.getElementById("login-account-label");
+  const submitBtn = loginForm.querySelector(".login-submit");
+  const feedback = document.getElementById("login-feedback");
+  if (!loginScreen || !loginForm) return;
+
+  const REMEMBER_KEY = "bailongma-login-preview-remembered";
+  const SESSION_KEY = "bailongma-login-preview-session";
+  const params = new URLSearchParams(window.location.search);
+  const forceLogin = params.get("login") === "1";
+  const previewEnabled = params.get("preview") === "1";
+  const remembered = localStorage.getItem(REMEMBER_KEY) === "true";
+  const sessionPassed = sessionStorage.getItem(SESSION_KEY) === "true";
+  let authMode = "login";
+  if (loginSkip) loginSkip.hidden = !previewEnabled;
+
+  const setFeedback = (message = "", isError = false) => {
+    if (!feedback) return;
+    feedback.textContent = message;
+    feedback.classList.toggle("error", Boolean(isError));
+  };
+
+  const setBusy = (busy) => {
+    if (submitBtn) submitBtn.disabled = busy;
+    if (loginSkip) loginSkip.disabled = busy;
+    if (loginActivate) loginActivate.disabled = busy;
+  };
+
+  const applyAuthMode = (mode, admin = null) => {
+    authMode = mode;
+    const isSetup = mode === "setup";
+    if (title) title.textContent = isSetup ? "初始化管理员" : "登录 BaiLongma";
+    if (subtitle) {
+      subtitle.textContent = isSetup
+        ? "首次启动，设置本机管理员账号"
+        : (admin?.username ? `欢迎回来，${admin.username}` : "进入本地智能体工作台");
+    }
+    if (accountLabel) accountLabel.textContent = isSetup ? "用户名" : "账号 / 手机号";
+    if (account) {
+      account.placeholder = isSetup ? "请输入管理员用户名" : "请输入账号或手机号";
+      account.autocomplete = isSetup ? "username" : "username";
+    }
+    if (password) {
+      password.placeholder = isSetup ? "设置至少 6 位密码" : "请输入密码";
+      password.autocomplete = isSetup ? "new-password" : "current-password";
+    }
+    if (phoneField) phoneField.hidden = !isSetup;
+    if (submitBtn) submitBtn.textContent = isSetup ? "完成初始化" : "登录";
+    setFeedback("");
+  };
+
+  const hideLogin = () => {
+    loginScreen.classList.add("login-screen-hidden");
+    loginScreen.setAttribute("aria-hidden", "true");
+    setTimeout(() => {
+      loginScreen.hidden = true;
+    }, 260);
+  };
+
+  const enterPreview = () => {
+    if (remember?.checked) {
+      localStorage.setItem(REMEMBER_KEY, "true");
+    } else {
+      sessionStorage.setItem(SESSION_KEY, "true");
+    }
+    hideLogin();
+  };
+
+  if (!forceLogin && (remembered || sessionPassed)) {
+    loginScreen.hidden = true;
+    return;
+  }
+
+  async function loadAuthStatus() {
+    try {
+      const res = await fetch(`${API}/auth/status`);
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data?.configured === false) {
+        applyAuthMode("setup");
+      } else {
+        applyAuthMode("login", data?.admin || null);
+      }
+    } catch {
+      applyAuthMode("login");
+      setFeedback("未连接到本地后台，可先预览进入。", true);
+    }
+  }
+
+  loginForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    setBusy(true);
+    setFeedback("");
+    try {
+      const payload = authMode === "setup"
+        ? {
+            username: account?.value?.trim() || "",
+            phone: phone?.value?.trim() || "",
+            password: password?.value || "",
+          }
+        : {
+            account: account?.value?.trim() || "",
+            password: password?.value || "",
+          };
+      const res = await fetch(`${API}${authMode === "setup" ? "/auth/setup" : "/auth/login"}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "操作失败");
+      enterPreview();
+    } catch (err) {
+      setFeedback(err.message || "操作失败", true);
+    } finally {
+      setBusy(false);
+    }
+  });
+
+  loginSkip?.addEventListener("click", enterPreview);
+  loginActivate?.addEventListener("click", () => {
+    hideLogin();
+    setTimeout(() => openSettingsRef?.("llm"), 120);
+  });
+
+  loadAuthStatus();
+  requestAnimationFrame(() => account?.focus?.());
+}
+
+initLoginScreen();
 
 function addMsg(...args) { return chat?.addMsg(...args); }
 function openChat(...args) { return chat?.openChat(...args); }
@@ -321,10 +487,8 @@ function resetZoom() {
 
 const glowSet = new Map();
 const usePulseSet = new Map();
-let linkData = [];
-let nodeData = [];
-let linkSel = gLink.selectAll("line");
-let nodeSel = gNode.selectAll("circle");
+linkSel = gLink.selectAll("line");
+nodeSel = gNode.selectAll("circle");
 
 const nodeCountEl = document.getElementById("node-count");
 const linkCountEl = document.getElementById("link-count");
@@ -1274,9 +1438,32 @@ function extractNids(memList) {
     .filter(Boolean);
 }
 
+function setVoiceAgentState(state, data = {}, reason = state) {
+  const voice = window.bailongmaVoice;
+  if (!voice?.setAgentState) return;
+  const current = voice.getState?.();
+  const activeTurn = current?.state === "thinking" || current?.state === "executing";
+  voice.setAgentState(state, {
+    reason,
+    // Keep the local turn id stable once a turn has started. Backend session
+    // refs are useful as metadata, but replacing the id mid-turn breaks event
+    // correlation for subscribers.
+    turnId: activeTurn ? undefined : (data.turnId || data.sessionRef || undefined),
+    newTurn: !activeTurn && state === "thinking",
+    meta: {
+      eventType: data.type || undefined,
+      name: data.name || undefined,
+      label: data.label || undefined,
+      sessionRef: data.sessionRef || data.turnId || undefined,
+    },
+  });
+}
+
 function handle({ type, data = {} }) {
+  const shouldSpeakForThisClient = () => !data.speechClientId || data.speechClientId === BLM_CLIENT_ID;
   switch (type) {
     case "message_received": {
+      setVoiceAgentState("thinking", { ...data, type }, "agent-turn-started");
       currentPath = "l1";
       // 兜底：上一轮若被打断、message/response 均未到达，实时气泡会成孤儿、流式会话可能还挂着麦克风
       // ——定稿气泡、收尾流式会话（恢复麦克风）、复位状态，再开新一轮。
@@ -1307,7 +1494,7 @@ function handle({ type, data = {} }) {
       // 正文流（plainReply）：把 token 实时打进聊天气泡。一轮可能有多段正文（正文→工具→正文），
       // 只在尚未开始时建气泡，后续段累积进同一个。speak 轮（语音）额外开启逐句流式合成。
       if (data.mode === "text" && data.plainReply) {
-        if (data.speak) liveTurnSpeak = true;
+        if (data.speak && shouldSpeakForThisClient()) liveTurnSpeak = true;
         if (!liveReplyActive) {
           liveReplyActive = true;
           liveRawText = "";
@@ -1333,6 +1520,7 @@ function handle({ type, data = {} }) {
       if (data.mode === "text" && sttsActive) flushStreamingTTSBuf();
       break;
     case "tool_preparing": {
+      setVoiceAgentState("executing", { ...data, type }, "tool-preparing");
       // 思考动画已停，但工具尚未真正执行 —— 给一个占位状态避免 UI 死寂
       const stream = currentStream();
       const label = data.name ? stream.toolLabel(data.name) : "";
@@ -1340,6 +1528,7 @@ function handle({ type, data = {} }) {
       break;
     }
     case "tool_executing": {
+      setVoiceAgentState("executing", { ...data, type }, "tool-executing");
       const stream = currentStream();
       const label = data.name ? stream.toolLabel(data.name) : "工具";
       stream.setTimedStatus(`正在执行 ${label}…`, "busy", {
@@ -1353,6 +1542,7 @@ function handle({ type, data = {} }) {
       recordAiActivity(data.name);
       break;
     case "response":
+      setVoiceAgentState("completed", { ...data, type }, "agent-response-completed");
       // Round complete — stop all animations
       currentStream().end();
       // 兜底：本轮结束时（response 必在 message 之后发）若流式合成会话仍开着——极少见，模型只调了工具
@@ -1363,6 +1553,7 @@ function handle({ type, data = {} }) {
       liveReplyActive = false; liveRawText = ""; liveTurnSpeak = false;
       break;
     case "processing_preempted":
+      setVoiceAgentState("interrupted", { ...data, type }, "agent-turn-preempted");
       currentStream().end();
       break;
     case "llm_retry": {
@@ -1379,10 +1570,12 @@ function handle({ type, data = {} }) {
       break;
     }
     case "message_dropped":
+      setVoiceAgentState("failed", { ...data, type }, "agent-message-dropped");
       currentStream().startThinkingSession();
       currentStream().setStatus("LLM 繁忙，重试次数已达上限", "failed");
       break;
     case "error":
+      setVoiceAgentState("failed", { ...data, type }, "agent-error");
       if (isBusyErrorMessage(data.error)) {
         currentStream().startThinkingSession();
         currentStream().setStatus("LLM 繁忙，请稍后重试", "busy");
@@ -1507,7 +1700,7 @@ function handle({ type, data = {} }) {
       }
       break;
     case "tts_reply":
-      if (data.text) playTTSReply(data.text);
+      if (data.text && shouldSpeakForThisClient()) playTTSReply(data.text);
       break;
     case "key_configured":
       chat.deleteLastUserMsg();
@@ -1591,6 +1784,7 @@ function playJarvisStartupSound() {
 // ── TTS reply playback ────────────────────────────────────────────────────────
 let ttsAudioEl = null;
 let ttsCurrentText = '';
+let activeTTSProvider = null; // 后端当前配置的 TTS 服务商，用于选择稳定播放路径
 let activeTTSVoiceId = null; // 后端当前配置的 TTS 音色，用于决定播放时是否叠加机器人音效
 let ttsInterruptedRemaining = '';
 let lastJarvisContent = '';
@@ -1635,6 +1829,7 @@ function setTTSStreamingEnabled(on) {
 // 仅当开启 + 浏览器支持 MSE 流式 MP3 时才走流式，否则退回整段 blob 播放（绝不让声音变哑）
 function ttsCanStream() {
   if (!isTTSStreamingEnabled()) return false;
+  if (['baidu', 'minimax', 'volcano'].includes(String(activeTTSProvider || '').toLowerCase())) return false;
   if (typeof window.MediaSource === 'undefined') return false;
   try { return MediaSource.isTypeSupported('audio/mpeg'); } catch { return false; }
 }
@@ -1746,7 +1941,11 @@ function activateTTSAudioGraph(graph) {
     try { ttsAudioGraph.teardown?.(); } catch {}
   }
   ttsAudioGraph = graph || null;
-  window.bailongmaVoice?.setTTSAnalyser?.(ttsAudioGraph?.analyser || null);
+  window.bailongmaVoice?.setTTSAnalyser?.(ttsAudioGraph?.analyser || (graph === null ? true : null));
+}
+
+function shouldAttachTTSGraph() {
+  return isFxUnlocked() && isFxEnabledForVoice(activeTTSVoiceId);
 }
 
 function clearTTSAudioGraph(graph) {
@@ -1772,16 +1971,18 @@ function startTTSAudio(audioEl, revokeUrl, opts = {}) {
   const { manageMic = true, onComplete = null } = opts;
   ttsAudioEl = audioEl;
   audioEl.volume = 1.0; // ensure full volume (avoid residual duck state from previous play)
-  const audioGraph = attachJarvisAudioGraph(audioEl, activeTTSVoiceId);
+  const audioGraph = shouldAttachTTSGraph() ? attachJarvisAudioGraph(audioEl, activeTTSVoiceId) : null;
   activateTTSAudioGraph(audioGraph);
   // Suspend cloud ASR but keep the mic hardware open for interruption detection
   if (manageMic) window.bailongmaVoice?.suspendForTTS?.();
   // 结束/出错收尾。注意：被新一轮播放替换掉的旧元素，其 onerror 可能在 pause/revoke 后迟到触发；
   // 此时全局已指向新元素，必须用 ttsAudioEl===audioEl 守卫，否则会误杀新播放的流读取器和状态。
   const finish = () => {
-    clearTTSAudioGraph(audioGraph);
+    const isCurrent = ttsAudioEl === audioEl;
+    if (audioGraph) clearTTSAudioGraph(audioGraph);
+    else if (isCurrent) window.bailongmaVoice?.setTTSAnalyser?.(null);
     if (revokeUrl) { try { URL.revokeObjectURL(revokeUrl); } catch {} } // 释放本元素 URL（无论是否当前）
-    if (ttsAudioEl !== audioEl) return; // 已不是当前播放对象：仅回收 URL，不动全局
+    if (!isCurrent) return; // 已不是当前播放对象：仅回收 URL，不动全局
     if (ttsStreamReader) { try { ttsStreamReader.cancel(); } catch {} ttsStreamReader = null; }
     ttsAudioEl = null;
     if (onComplete) { onComplete(); return; } // 队列段：交回队列推进，麦克风/收尾由队列统一管
@@ -1789,14 +1990,20 @@ function startTTSAudio(audioEl, revokeUrl, opts = {}) {
     if (manageMic) window.bailongmaVoice?.resumeAfterMedia();
   };
   audioEl.onended = finish;
-  audioEl.onerror = finish;
+  audioEl.onerror = () => {
+    ttsLog("audio error", audioEl.error?.message || audioEl.error?.code || "unknown");
+    finish();
+  };
   // 把这段语音显式路由到真实输出设备（规避被系统默认占用的虚拟/已拔出声卡）。
   // setSinkId 是异步的，但对流式 TTS，首个音频样本要等网络首包到达才流出，
   // 这点路由耗时（毫秒级）远在出声之前完成 → 不必 await，也不会让首音漏到默认设备。
   applyOutputSink(audioEl).catch(() => {});
-  audioEl.play().catch(() => {
-    clearTTSAudioGraph(audioGraph);
+  audioEl.play().catch((err) => {
+    ttsLog("play failed", err?.message || String(err || "unknown"));
+    if (audioGraph) clearTTSAudioGraph(audioGraph);
+    else if (ttsAudioEl === audioEl) window.bailongmaVoice?.setTTSAnalyser?.(null);
     if (ttsAudioEl !== audioEl) return;
+    ttsAudioEl = null;
     if (onComplete) { ttsAudioEl = null; onComplete(); return; }
     if (manageMic) window.bailongmaVoice?.resumeAfterMedia();
   });
@@ -1877,7 +2084,8 @@ async function playTTSReply(text) {
       const url = URL.createObjectURL(blob);
       startTTSAudio(new Audio(url), url);
     }
-  } catch {
+  } catch (err) {
+    ttsLog("reply failed", err?.message || String(err || "unknown"));
     clearTTSAudioGraph();
     ttsCurrentText = '';
     window.bailongmaVoice?.resumeAfterMedia();
@@ -1984,7 +2192,8 @@ async function pumpSttsQueue() {
       const url = URL.createObjectURL(blob);
       startTTSAudio(new Audio(url), url, { manageMic: false, onComplete });
     }
-  } catch {
+  } catch (err) {
+    ttsLog("segment failed", err?.message || String(err || "unknown"));
     onComplete(); // 本句合成失败：跳过，继续下一句，绝不卡住队列
   }
 }
@@ -2121,6 +2330,7 @@ chat = initChat({
   apiBase: API,
   maxHistory: MAX_CHAT_HISTORY,
   activationWarmupKey: ACTIVATION_WARMUP_KEY,
+  clientId: BLM_CLIENT_ID,
   getAgentName: () => agentName,
   defaultInputPlaceholder,
   openSettings: (tab) => openSettingsRef?.(tab),
@@ -2237,6 +2447,15 @@ function initTTSSettings() {
       if (doubaoRateVal) doubaoRateVal.textContent = fmtRate(parseInt(doubaoRateEl.value, 10) || 0);
     });
   }
+  const fmtBaiduRange = (v) => String(parseInt(v, 10) || 0);
+  ["speed", "pitch", "volume"].forEach((key) => {
+    const el = document.getElementById(`tts-baidu-${key}`);
+    const val = document.getElementById(`tts-baidu-${key}-val`);
+    if (!el) return;
+    el.addEventListener("input", () => {
+      if (val) val.textContent = fmtBaiduRange(el.value);
+    });
+  });
 
   // 付费解锁
   const fxLockBox = document.getElementById("tts-fx-lock");
@@ -2277,6 +2496,7 @@ function initTTSSettings() {
 
   const credSections = {
     doubao:     document.getElementById("tts-creds-doubao"),
+    baidu:      document.getElementById("tts-creds-baidu"),
     minimax:    document.getElementById("tts-creds-minimax"),
     openai:     document.getElementById("tts-creds-openai"),
     elevenlabs: document.getElementById("tts-creds-elevenlabs"),
@@ -2302,8 +2522,10 @@ function initTTSSettings() {
   }
 
   providerSel.addEventListener("change", () => {
+    activeTTSProvider = providerSel.value;
     showCredSection(providerSel.value);
     updateVoiceOptions(providerSel.value);
+    if (testStatus) testStatus.textContent = "";
   });
 
   fetch(`${API}/settings/tts`).then(r => r.json()).then(({ tts, voices }) => {
@@ -2311,6 +2533,7 @@ function initTTSSettings() {
     const provider = tts?.ttsProvider || "doubao";
     if (tts?.ttsProvider) providerSel.value = tts.ttsProvider;
     else providerSel.value = "doubao";
+    activeTTSProvider = provider;
     updateVoiceOptions(provider, tts?.ttsVoiceId);
     activeTTSVoiceId = voiceSel?.value || tts?.ttsVoiceId || null;
     const appidEl = document.getElementById("tts-volcano-appid");
@@ -2328,6 +2551,17 @@ function initTTSSettings() {
       const rv = document.getElementById("tts-doubao-rate-val");
       if (rv) rv.textContent = r === 0 ? "正常" : (r > 0 ? "+" + r : String(r));
     }
+    const baiduCuidEl = document.getElementById("tts-baidu-cuid");
+    if (baiduCuidEl && tts?.baiduCuid) baiduCuidEl.value = tts.baiduCuid;
+    ["speed", "pitch", "volume"].forEach((key) => {
+      const configKey = `baidu${key[0].toUpperCase()}${key.slice(1)}`;
+      const el = document.getElementById(`tts-baidu-${key}`);
+      const val = document.getElementById(`tts-baidu-${key}-val`);
+      if (!el) return;
+      const n = Number(tts?.[configKey] ?? 5) || 5;
+      el.value = n;
+      if (val) val.textContent = String(n);
+    });
     const baseurlEl = document.getElementById("tts-openai-baseurl");
     if (baseurlEl && tts?.openaiTtsBaseURL) baseurlEl.value = tts.openaiTtsBaseURL;
     showCredSection(provider);
@@ -2335,46 +2569,64 @@ function initTTSSettings() {
 
   showCredSection(providerSel.value);
 
+  function collectTTSFormBody() {
+    const body = { ttsProvider: providerSel.value };
+    activeTTSProvider = providerSel.value;
+    const voiceId = voiceSel?.value?.trim();
+    if (voiceId) { body.ttsVoiceId = voiceId; activeTTSVoiceId = voiceId; }
+    const minimaxKey = document.getElementById("tts-minimax-key")?.value?.trim();
+    if (minimaxKey) body.minimaxKey = minimaxKey;
+    const doubaoKey = document.getElementById("tts-doubao-key")?.value?.trim();
+    if (doubaoKey) body.doubaoKey = doubaoKey;
+    const doubaoResource = document.getElementById("tts-doubao-resource")?.value?.trim();
+    if (doubaoResource) body.doubaoResourceId = doubaoResource;
+    const doubaoStyleEl2 = document.getElementById("tts-doubao-style");
+    if (doubaoStyleEl2) body.doubaoStyle = doubaoStyleEl2.value.trim(); // 空＝清除（回中性）
+    const rateEl2 = document.getElementById("tts-doubao-rate");
+    if (rateEl2) body.doubaoSpeechRate = rateEl2.value;
+    const doubaoAppId = document.getElementById("tts-doubao-appid")?.value?.trim();
+    if (doubaoAppId) body.doubaoAppId = doubaoAppId;
+    const doubaoAccessKey = document.getElementById("tts-doubao-access-key")?.value?.trim();
+    if (doubaoAccessKey) body.doubaoAccessKey = doubaoAccessKey;
+    const baiduApiKey = document.getElementById("tts-baidu-api-key")?.value?.trim();
+    if (baiduApiKey) body.baiduApiKey = baiduApiKey;
+    const baiduSecretKey = document.getElementById("tts-baidu-secret-key")?.value?.trim();
+    if (baiduSecretKey) body.baiduSecretKey = baiduSecretKey;
+    const baiduCuid = document.getElementById("tts-baidu-cuid")?.value?.trim();
+    if (baiduCuid) body.baiduCuid = baiduCuid;
+    ["speed", "pitch", "volume"].forEach((key) => {
+      const el = document.getElementById(`tts-baidu-${key}`);
+      if (!el) return;
+      body[`baidu${key[0].toUpperCase()}${key.slice(1)}`] = el.value;
+    });
+    const openaiKey = document.getElementById("tts-openai-key")?.value?.trim();
+    if (openaiKey) body.openaiTtsKey = openaiKey;
+    const baseURL = document.getElementById("tts-openai-baseurl")?.value?.trim();
+    if (baseURL) body.openaiTtsBaseURL = baseURL;
+    const elevenKey = document.getElementById("tts-elevenlabs-key")?.value?.trim();
+    if (elevenKey) body.elevenLabsKey = elevenKey;
+    const volcanoAppId = document.getElementById("tts-volcano-appid")?.value?.trim();
+    if (volcanoAppId) body.volcanoAppId = volcanoAppId;
+    const volcanoToken = document.getElementById("tts-volcano-token")?.value?.trim();
+    if (volcanoToken) body.volcanoToken = volcanoToken;
+    return body;
+  }
+
   const origSaveBtn = document.getElementById("settings-save-voice");
   if (origSaveBtn) {
     origSaveBtn.addEventListener("click", () => {
-      const ttsBody = { ttsProvider: providerSel.value };
-      const voiceId  = voiceSel?.value?.trim();
-      if (voiceId) { ttsBody.ttsVoiceId = voiceId; activeTTSVoiceId = voiceId; }
-      const minimaxKey = document.getElementById("tts-minimax-key")?.value?.trim();
-      if (minimaxKey) ttsBody.minimaxKey = minimaxKey;
-      const doubaoKey = document.getElementById("tts-doubao-key")?.value?.trim();
-      if (doubaoKey) ttsBody.doubaoKey = doubaoKey;
-      const doubaoResource = document.getElementById("tts-doubao-resource")?.value?.trim();
-      if (doubaoResource) ttsBody.doubaoResourceId = doubaoResource;
-      const doubaoStyleEl2 = document.getElementById("tts-doubao-style");
-      if (doubaoStyleEl2) ttsBody.doubaoStyle = doubaoStyleEl2.value.trim(); // 空＝清除（回中性）
-      const rateEl2 = document.getElementById("tts-doubao-rate");
-      if (rateEl2) ttsBody.doubaoSpeechRate = rateEl2.value;
-      const doubaoAppId = document.getElementById("tts-doubao-appid")?.value?.trim();
-      if (doubaoAppId) ttsBody.doubaoAppId = doubaoAppId;
-      const doubaoAccessKey = document.getElementById("tts-doubao-access-key")?.value?.trim();
-      if (doubaoAccessKey) ttsBody.doubaoAccessKey = doubaoAccessKey;
-      const openaiKey = document.getElementById("tts-openai-key")?.value?.trim();
-      if (openaiKey) ttsBody.openaiTtsKey = openaiKey;
-      const baseURL = document.getElementById("tts-openai-baseurl")?.value?.trim();
-      if (baseURL) ttsBody.openaiTtsBaseURL = baseURL;
-      const elevenKey = document.getElementById("tts-elevenlabs-key")?.value?.trim();
-      if (elevenKey) ttsBody.elevenLabsKey = elevenKey;
-      const volcanoAppId = document.getElementById("tts-volcano-appid")?.value?.trim();
-      if (volcanoAppId) ttsBody.volcanoAppId = volcanoAppId;
-      const volcanoToken = document.getElementById("tts-volcano-token")?.value?.trim();
-      if (volcanoToken) ttsBody.volcanoToken = volcanoToken;
+      const ttsBody = collectTTSFormBody();
 
       fetch(`${API}/settings/tts`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(ttsBody),
       }).then(() => {
-        ["tts-minimax-key", "tts-doubao-key", "tts-doubao-access-key", "tts-openai-key", "tts-elevenlabs-key", "tts-volcano-token"].forEach(id => {
+        ["tts-minimax-key", "tts-doubao-key", "tts-doubao-access-key", "tts-baidu-api-key", "tts-baidu-secret-key", "tts-openai-key", "tts-elevenlabs-key", "tts-volcano-token"].forEach(id => {
           const el = document.getElementById(id);
           if (el) el.value = "";
         });
+        if (testStatus) testStatus.textContent = "";
       }).catch(() => {});
     });
   }
@@ -2384,31 +2636,7 @@ function initTTSSettings() {
       testBtn.disabled = true;
       if (testStatus) testStatus.textContent = "保存配置中…";
       try {
-        const preBody = { ttsProvider: providerSel.value };
-        const currentVoice = voiceSel?.value?.trim();
-        if (currentVoice) { preBody.ttsVoiceId = currentVoice; activeTTSVoiceId = currentVoice; }
-        const minimaxKey2 = document.getElementById("tts-minimax-key")?.value?.trim();
-        if (minimaxKey2) preBody.minimaxKey = minimaxKey2;
-        const doubaoKey = document.getElementById("tts-doubao-key")?.value?.trim();
-        if (doubaoKey) preBody.doubaoKey = doubaoKey;
-        const doubaoResource = document.getElementById("tts-doubao-resource")?.value?.trim();
-        if (doubaoResource) preBody.doubaoResourceId = doubaoResource;
-        const doubaoStyleEl3 = document.getElementById("tts-doubao-style");
-        if (doubaoStyleEl3) preBody.doubaoStyle = doubaoStyleEl3.value.trim();
-        const rateEl3 = document.getElementById("tts-doubao-rate");
-        if (rateEl3) preBody.doubaoSpeechRate = rateEl3.value;
-        const doubaoAppId = document.getElementById("tts-doubao-appid")?.value?.trim();
-        if (doubaoAppId) preBody.doubaoAppId = doubaoAppId;
-        const doubaoAccessKey = document.getElementById("tts-doubao-access-key")?.value?.trim();
-        if (doubaoAccessKey) preBody.doubaoAccessKey = doubaoAccessKey;
-        const openaiKey = document.getElementById("tts-openai-key")?.value?.trim();
-        if (openaiKey) preBody.openaiTtsKey = openaiKey;
-        const elevenKey = document.getElementById("tts-elevenlabs-key")?.value?.trim();
-        if (elevenKey) preBody.elevenLabsKey = elevenKey;
-        const volcanoAppId = document.getElementById("tts-volcano-appid")?.value?.trim();
-        if (volcanoAppId) preBody.volcanoAppId = volcanoAppId;
-        const volcanoToken = document.getElementById("tts-volcano-token")?.value?.trim();
-        if (volcanoToken) preBody.volcanoToken = volcanoToken;
+        const preBody = collectTTSFormBody();
         await fetch(`${API}/settings/tts`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -2566,7 +2794,6 @@ function initTTSSettings() {
       return {
         ...summary,
         ...llm,
-        apiKey: llm.apiKey ?? summary.apiKey ?? "",
       };
     }
     return summary;
@@ -2582,7 +2809,10 @@ function initTTSSettings() {
     if (provider === "auto") {
       if (customSection) customSection.style.display = "none";
       if (modelRow) modelRow.style.display = "none";
-      if (llmKeyInput) llmKeyInput.value = "";
+      if (llmKeyInput) {
+        llmKeyInput.value = "";
+        llmKeyInput.placeholder = "自动识别需要输入 API Key";
+      }
       setLlmKeyVisible(false);
       return;
     }
@@ -2603,7 +2833,12 @@ function initTTSSettings() {
         );
       }
     }
-    if (llmKeyInput) llmKeyInput.value = providerCfg.apiKey || "";
+    if (llmKeyInput) {
+      llmKeyInput.value = "";
+      llmKeyInput.placeholder = providerCfg.configured
+        ? "已配置，留空以保持不变"
+        : "输入 API Key";
+    }
     setLlmKeyVisible(false);
   }
 
@@ -2897,11 +3132,13 @@ function initTTSSettings() {
   const VOICE_AUTO_MIC_KEY   = "bailongma-voice-auto-mic";
   const VOICE_THRESHOLD_KEY  = "bailongma-voice-threshold";
   const VOICE_PROVIDER_KEY   = "bailongma-voice-provider";
+  const VOICE_BAIDU_MODE_KEY = "bailongma-voice-baidu-mode";
   const VOICE_MIC_DEVICE_KEY = "bailongma-voice-mic-device-id";
 
   function applyVoiceProviderUI(provider) {
     const panels = {
       aliyun: "voice-cred-aliyun",
+      baidu: "voice-cred-baidu",
       volcengine: "voice-cred-volcengine",
       tencent: "voice-cred-tencent",
       xunfei: "voice-cred-xunfei",
@@ -3118,7 +3355,7 @@ function initTTSSettings() {
     if (langSelect) langSelect.value = localStorage.getItem(VOICE_LANG_KEY) || "zh-CN";
     if (autoSend) autoSend.checked = localStorage.getItem(VOICE_AUTO_SEND_KEY) !== "false";
     const autoMic = document.getElementById("voice-auto-mic");
-    if (autoMic) autoMic.checked = localStorage.getItem(VOICE_AUTO_MIC_KEY) === "true";
+    if (autoMic) autoMic.checked = localStorage.getItem(VOICE_AUTO_MIC_KEY) !== "false";
     const savedThresh = parseFloat(localStorage.getItem(VOICE_THRESHOLD_KEY) || "0.008");
     if (voiceThreshSlider) voiceThreshSlider.value = String(savedThresh);
     if (voiceThreshVal)    voiceThreshVal.textContent = savedThresh.toFixed(3);
@@ -3132,6 +3369,17 @@ function initTTSSettings() {
       if (resp.ok && data?.voice?.voiceProvider) {
         savedProvider = data.voice.voiceProvider;
         localStorage.setItem(VOICE_PROVIDER_KEY, savedProvider);
+        const baiduModeEl = document.getElementById("voice-baidu-mode");
+        if (baiduModeEl && data.voice.baiduAsrMode?.value) {
+          baiduModeEl.value = data.voice.baiduAsrMode.value;
+          localStorage.setItem(VOICE_BAIDU_MODE_KEY, data.voice.baiduAsrMode.value);
+        }
+        const baiduAppIdEl = document.getElementById("voice-baidu-appid");
+        if (baiduAppIdEl && data.voice.baiduAsrAppId?.value) baiduAppIdEl.value = data.voice.baiduAsrAppId.value;
+        const baiduDevPidEl = document.getElementById("voice-baidu-devpid");
+        if (baiduDevPidEl && data.voice.baiduAsrDevPid?.value) baiduDevPidEl.value = data.voice.baiduAsrDevPid.value;
+        const baiduCuidEl = document.getElementById("voice-baidu-cuid");
+        if (baiduCuidEl && data.voice.baiduAsrCuid?.value) baiduCuidEl.value = data.voice.baiduAsrCuid.value;
       }
     } catch {}
     if (voiceProviderSelect) voiceProviderSelect.value = savedProvider;
@@ -3159,6 +3407,8 @@ function initTTSSettings() {
       localStorage.setItem(VOICE_AUTO_MIC_KEY,   String(autoMic));
       localStorage.setItem(VOICE_THRESHOLD_KEY,  String(threshold));
       localStorage.setItem(VOICE_PROVIDER_KEY,   provider);
+      const baiduMode = document.getElementById("voice-baidu-mode")?.value?.trim() || "rest";
+      localStorage.setItem(VOICE_BAIDU_MODE_KEY, baiduMode);
       if (micDeviceId) localStorage.setItem(VOICE_MIC_DEVICE_KEY, micDeviceId);
       else localStorage.removeItem(VOICE_MIC_DEVICE_KEY);
 
@@ -3169,6 +3419,17 @@ function initTTSSettings() {
       const body = { voiceProvider: provider };
       const aliyunKey = document.getElementById("voice-aliyun-key")?.value?.trim();
       if (aliyunKey) body.aliyunApiKey = aliyunKey;
+      if (baiduMode) body.baiduAsrMode = baiduMode;
+      const baiduAppId = document.getElementById("voice-baidu-appid")?.value?.trim();
+      if (baiduAppId) body.baiduAsrAppId = baiduAppId;
+      const baiduApiKey = document.getElementById("voice-baidu-apikey")?.value?.trim();
+      if (baiduApiKey) body.baiduAsrApiKey = baiduApiKey;
+      const baiduSecretKey = document.getElementById("voice-baidu-secretkey")?.value?.trim();
+      if (baiduSecretKey) body.baiduAsrSecretKey = baiduSecretKey;
+      const baiduDevPid = document.getElementById("voice-baidu-devpid")?.value?.trim();
+      if (baiduDevPid) body.baiduAsrDevPid = baiduDevPid;
+      const baiduCuid = document.getElementById("voice-baidu-cuid")?.value?.trim();
+      if (baiduCuid) body.baiduAsrCuid = baiduCuid;
       const tencentSid = document.getElementById("voice-tencent-sid")?.value?.trim();
       if (tencentSid) body.tencentSecretId = tencentSid;
       const tencentSkey = document.getElementById("voice-tencent-skey")?.value?.trim();
@@ -3200,6 +3461,8 @@ function initTTSSettings() {
           [
             "voice-aliyun-key",
             "voice-auto-key",
+            "voice-baidu-apikey",
+            "voice-baidu-secretkey",
             "voice-tencent-sid",
             "voice-tencent-skey",
             "voice-xunfei-apikey",
@@ -3315,7 +3578,6 @@ function initTTSSettings() {
     const apiKey = llmKeyInput.value.trim();
     saveLlmBtn.disabled = true;
     try {
-      const selectedCfg = cachedProviders?.[provider] || {};
       const body = { provider };
       if (provider === "custom") {
         body.baseURL = document.getElementById("settings-custom-baseurl")?.value?.trim();
@@ -3325,7 +3587,7 @@ function initTTSSettings() {
           saveLlmBtn.disabled = false;
           return;
         }
-        if (apiKey !== (selectedCfg.apiKey || "")) body.apiKey = apiKey || "none";
+        if (apiKey) body.apiKey = apiKey;
       } else if (provider === "auto") {
         if (!apiKey) {
           showFeedback(llmFeedback, "自动识别需要填入 API Key", true);
@@ -3335,7 +3597,7 @@ function initTTSSettings() {
         body.apiKey = apiKey;
       } else {
         body.model = modelSelect.value;
-        if (apiKey && apiKey !== (selectedCfg.apiKey || "")) body.apiKey = apiKey;
+        if (apiKey) body.apiKey = apiKey;
       }
 
       const res = await fetch(`${API}/settings/model`, {
@@ -3645,7 +3907,7 @@ initVoicePanel({
   getSendMessage: (options) => chat?.send?.(options),
   getLang:       () => localStorage.getItem("bailongma-voice-lang") || "zh-CN",
   getAutoSend:   () => localStorage.getItem("bailongma-voice-auto-send") !== "false",
-  getAutoMic:    () => localStorage.getItem("bailongma-voice-auto-mic") === "true",
+  getAutoMic:    () => localStorage.getItem("bailongma-voice-auto-mic") !== "false",
 });
 
 // ── 语音输出设备路由 ──

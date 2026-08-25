@@ -210,11 +210,43 @@ function decodeRequestBody(buffer, contentType = '') {
   }
 }
 
-function readJsonBody(req) {
+const DEFAULT_JSON_BODY_LIMIT = 2 * 1024 * 1024
+
+function bodyTooLargeError(limit) {
+  const label = limit % (1024 * 1024) === 0
+    ? `${Math.round(limit / 1024 / 1024)}MB`
+    : `${Math.round(limit / 1024)}KB`
+  const err = new Error(`请求体过大（上限 ${label}）`)
+  err.statusCode = 413
+  return err
+}
+
+function readJsonBody(req, maxBytes = DEFAULT_JSON_BODY_LIMIT) {
   return new Promise((resolve, reject) => {
     const chunks = []
-    req.on('data', chunk => chunks.push(chunk))
+    let total = 0
+    let settled = false
+    const declaredLength = Number(req.headers['content-length'])
+    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+      settled = true
+      req.resume()
+      reject(bodyTooLargeError(maxBytes))
+      return
+    }
+    req.on('data', chunk => {
+      if (settled) return
+      total += chunk.length
+      if (total > maxBytes) {
+        settled = true
+        req.resume()
+        reject(bodyTooLargeError(maxBytes))
+        return
+      }
+      chunks.push(chunk)
+    })
     req.on('end', () => {
+      if (settled) return
+      settled = true
       try {
         const raw = decodeRequestBody(Buffer.concat(chunks), req.headers['content-type'])
         resolve(raw ? JSON.parse(raw) : {})
@@ -222,7 +254,11 @@ function readJsonBody(req) {
         reject(err)
       }
     })
-    req.on('error', reject)
+    req.on('error', err => {
+      if (settled) return
+      settled = true
+      reject(err)
+    })
   })
 }
 
@@ -265,6 +301,87 @@ function validateAgentName(agentName) {
     throw new Error('AI 名字只允许中文、英文字母、数字、空格、下划线、短横线')
   }
   return trimmedName
+}
+
+const LOCAL_ADMIN_CONFIG_KEY = 'local_admin'
+const LOCAL_ADMIN_PBKDF2_ITERATIONS = 210000
+const LOCAL_ADMIN_KEY_LENGTH = 32
+
+function readLocalAdmin() {
+  try {
+    const raw = getConfig(LOCAL_ADMIN_CONFIG_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object') return null
+    if (!parsed.passwordHash || !parsed.salt) return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+function publicLocalAdmin(admin = readLocalAdmin()) {
+  if (!admin) return null
+  return {
+    username: admin.username || '',
+    phone: admin.phone || '',
+    createdAt: admin.createdAt || null,
+  }
+}
+
+function validateLocalUsername(username) {
+  const value = String(username || '').trim()
+  if (!value) throw new Error('用户名不能为空')
+  if (value.length < 2 || value.length > 32) throw new Error('用户名长度需为 2-32 个字符')
+  if (!/^[一-龥A-Za-z0-9 _-]+$/.test(value)) {
+    throw new Error('用户名只允许中文、英文字母、数字、空格、下划线、短横线')
+  }
+  return value
+}
+
+function validateLocalPhone(phone) {
+  const value = String(phone || '').trim()
+  if (!value) throw new Error('手机号不能为空')
+  const normalized = value.replace(/[\s-]/g, '')
+  if (!/^\+?\d{7,15}$/.test(normalized)) throw new Error('手机号格式不正确')
+  return value
+}
+
+function validateLocalPassword(password) {
+  const value = String(password || '')
+  if (value.length < 6) throw new Error('密码至少 6 位')
+  if (value.length > 128) throw new Error('密码不能超过 128 位')
+  return value
+}
+
+function hashLocalPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
+  const passwordHash = crypto.pbkdf2Sync(
+    password,
+    salt,
+    LOCAL_ADMIN_PBKDF2_ITERATIONS,
+    LOCAL_ADMIN_KEY_LENGTH,
+    'sha256',
+  ).toString('hex')
+  return {
+    algorithm: 'pbkdf2-sha256',
+    iterations: LOCAL_ADMIN_PBKDF2_ITERATIONS,
+    salt,
+    passwordHash,
+  }
+}
+
+function verifyLocalPassword(password, admin) {
+  if (!admin?.salt || !admin?.passwordHash) return false
+  const iterations = Number(admin.iterations) || LOCAL_ADMIN_PBKDF2_ITERATIONS
+  const expected = Buffer.from(String(admin.passwordHash), 'hex')
+  const actual = crypto.pbkdf2Sync(
+    String(password || ''),
+    String(admin.salt),
+    iterations,
+    expected.length,
+    'sha256',
+  )
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual)
 }
 
 function publicActivationInfo(info) {
@@ -368,7 +485,7 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
     if (req.method === 'POST' && url.pathname === '/message') {
       try {
         const body = await readJsonBody(req)
-        const { from_id = 'ID:000001', content, channel = 'API' } = body
+        const { from_id = 'ID:000001', content, channel = 'API', client_id } = body
         if (!content?.trim()) return jsonResponse(res, 400, { error: 'content required' })
         const trimmed = content.trim()
         const strictEvaluation = body.strict_evaluation ?? body.strictEvaluation
@@ -377,11 +494,12 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
         const meta = {}
         if (strictEvaluation !== undefined) meta.strictEvaluation = strictEvaluation
         if (Array.isArray(forbiddenTools)) meta.forbiddenTools = forbiddenTools
+        if (typeof client_id === 'string' && client_id.trim()) meta.clientId = client_id.trim().slice(0, 80)
         pushMessage(from_id, trimmed, channel, meta)
         emitEvent('message_in', { from_id, content: trimmed, channel, timestamp: new Date().toISOString() })
         jsonResponse(res, 200, { ok: true, agent_name: getAgentName() })
-      } catch (e) {
-        jsonResponse(res, 400, { error: e.message })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { error: err.message })
       }
       return
     }
@@ -579,7 +697,7 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
             const state = setHotspotPanelState({ active, source: body.source || 'brain-ui' })
             jsonResponse(res, 200, { ok: true, state })
           })
-          .catch((err) => jsonResponse(res, 400, { ok: false, error: err.message }))
+          .catch((err) => jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message }))
         return
       }
     }
@@ -614,7 +732,7 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
             const state = setWorldcupPanelState({ active, source: body.source || 'brain-ui' })
             jsonResponse(res, 200, { ok: true, state })
           })
-          .catch((err) => jsonResponse(res, 400, { ok: false, error: err.message }))
+          .catch((err) => jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message }))
         return
       }
     }
@@ -635,7 +753,7 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
             const state = setDocPanelState({ active, topicId: body.topicId || null, source: body.source || 'brain-ui' })
             jsonResponse(res, 200, { ok: true, state })
           })
-          .catch((err) => jsonResponse(res, 400, { ok: false, error: err.message }))
+          .catch((err) => jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message }))
         return
       }
     }
@@ -684,7 +802,7 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
             })
             jsonResponse(res, 200, { ok: true, state })
           })
-          .catch((err) => jsonResponse(res, 400, { ok: false, error: err.message }))
+          .catch((err) => jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message }))
         return
       }
     }
@@ -704,6 +822,69 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
       return
     }
 
+    // GET /auth/status — local first-run admin status. This returns metadata only.
+    if (req.method === 'GET' && url.pathname === '/auth/status') {
+      const admin = readLocalAdmin()
+      jsonResponse(res, 200, {
+        ok: true,
+        configured: !!admin,
+        admin: publicLocalAdmin(admin),
+      })
+      return
+    }
+
+    // POST /auth/setup — create the first local admin. Password is stored as PBKDF2 hash.
+    if (req.method === 'POST' && url.pathname === '/auth/setup') {
+      if (!requireLocalOrToken(req, res, url)) return
+      try {
+        if (readLocalAdmin()) return jsonResponse(res, 409, { ok: false, error: '本机管理员已配置' })
+        const body = await readJsonBody(req)
+        const username = validateLocalUsername(body.username)
+        const phone = validateLocalPhone(body.phone)
+        const password = validateLocalPassword(body.password)
+        const now = new Date().toISOString()
+        const admin = {
+          username,
+          phone,
+          ...hashLocalPassword(password),
+          createdAt: now,
+          updatedAt: now,
+        }
+        setConfig(LOCAL_ADMIN_CONFIG_KEY, JSON.stringify(admin))
+        jsonResponse(res, 200, {
+          ok: true,
+          configured: true,
+          admin: publicLocalAdmin(admin),
+        })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message })
+      }
+      return
+    }
+
+    // POST /auth/login — local password check for the UI gate. It does not create a remote session.
+    if (req.method === 'POST' && url.pathname === '/auth/login') {
+      if (!requireLocalOrToken(req, res, url)) return
+      try {
+        const admin = readLocalAdmin()
+        if (!admin) return jsonResponse(res, 409, { ok: false, needsSetup: true, error: '请先初始化管理员' })
+        const body = await readJsonBody(req)
+        const account = String(body.account || '').trim()
+        const password = String(body.password || '')
+        const allowedAccounts = [admin.username, admin.phone].map(v => String(v || '').trim()).filter(Boolean)
+        if (!allowedAccounts.includes(account) || !verifyLocalPassword(password, admin)) {
+          return jsonResponse(res, 401, { ok: false, error: '账号或密码不正确' })
+        }
+        jsonResponse(res, 200, {
+          ok: true,
+          admin: publicLocalAdmin(admin),
+        })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message })
+      }
+      return
+    }
+
     // GET /media/history?limit=30
     if (req.method === 'GET' && url.pathname === '/media/history') {
       const limit = Math.min(parseInt(url.searchParams.get('limit') || '30'), 100)
@@ -713,18 +894,14 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
 
     // POST /media/history — { kind, url, title, videoId, platform }
     if (req.method === 'POST' && url.pathname === '/media/history') {
-      const chunks = []
-      req.on('data', c => chunks.push(c))
-      req.on('end', () => {
-        try {
-          const body = JSON.parse(Buffer.concat(chunks).toString())
-          if (!body.url || !body.kind) return jsonResponse(res, 400, { ok: false, error: 'url and kind required' })
-          upsertMediaHistory(body)
-          jsonResponse(res, 200, { ok: true })
-        } catch (e) {
-          jsonResponse(res, 400, { ok: false, error: e.message })
-        }
-      })
+      try {
+        const body = await readJsonBody(req)
+        if (!body.url || !body.kind) return jsonResponse(res, 400, { ok: false, error: 'url and kind required' })
+        upsertMediaHistory(body)
+        jsonResponse(res, 200, { ok: true })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message })
+      }
       return
     }
 
@@ -771,39 +948,25 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
     // POST /aivideo/draft — 面板把当前「开关状态 + 提示词草稿」实时同步给后端（感知通道）。
     // 后端只存内存状态，供注入器每轮贴进 agent 上下文。极轻量、不落库。
     if (req.method === 'POST' && url.pathname === '/aivideo/draft') {
-      const chunks = []
-      let size = 0
-      req.on('data', c => {
-        size += c.length
-        if (size > 256 * 1024) { req.destroy(); return }  // 草稿是纯文本，256KB 足够
-        chunks.push(c)
-      })
-      req.on('end', () => {
-        try {
-          const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'))
-          setAIVideoPanelState({ open: body.open, prompt: body.prompt })
-          jsonResponse(res, 200, { ok: true })
-        } catch (e) {
-          jsonResponse(res, 400, { ok: false, error: e.message })
-        }
-      })
-      req.on('error', () => { try { jsonResponse(res, 400, { ok: false, error: 'request error' }) } catch {} })
+      try {
+        const body = await readJsonBody(req, 256 * 1024)
+        setAIVideoPanelState({ open: body.open, prompt: body.prompt })
+        jsonResponse(res, 200, { ok: true })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message })
+      }
       return
     }
 
     // POST /aivideo/save — 把生成的视频复制到「下载\AI视频生成保存的视频\日期\」
     if (req.method === 'POST' && url.pathname === '/aivideo/save') {
-      const chunks = []
-      req.on('data', c => chunks.push(c))
-      req.on('end', () => {
-        try {
-          const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'))
-          const result = saveGeneratedVideo(body.jobId)
-          jsonResponse(res, result.ok ? 200 : 400, result)
-        } catch (e) {
-          jsonResponse(res, 400, { ok: false, error: e.message })
-        }
-      })
+      try {
+        const body = await readJsonBody(req)
+        const result = saveGeneratedVideo(body.jobId)
+        jsonResponse(res, result.ok ? 200 : 400, result)
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message })
+      }
       return
     }
 
@@ -838,19 +1001,15 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
     if (req.method === 'PATCH' && url.pathname.startsWith('/memories/')) {
       const id = parseInt(url.pathname.split('/')[2])
       if (!id) return jsonResponse(res, 400, { error: 'invalid id' })
-      const chunks = []
-      req.on('data', chunk => chunks.push(chunk))
-      req.on('end', () => {
-        try {
-          const { content, detail } = JSON.parse(Buffer.concat(chunks).toString('utf-8'))
-          const db = getDB()
-          if (content !== undefined) db.prepare('UPDATE memories SET content = ? WHERE id = ?').run(content, id)
-          if (detail !== undefined) db.prepare('UPDATE memories SET detail = ? WHERE id = ?').run(detail, id)
-          jsonResponse(res, 200, { ok: true })
-        } catch (e) {
-          jsonResponse(res, 400, { error: e.message })
-        }
-      })
+      try {
+        const { content, detail } = await readJsonBody(req)
+        const db = getDB()
+        if (content !== undefined) db.prepare('UPDATE memories SET content = ? WHERE id = ?').run(content, id)
+        if (detail !== undefined) db.prepare('UPDATE memories SET detail = ? WHERE id = ?').run(detail, id)
+        jsonResponse(res, 200, { ok: true })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { error: err.message })
+      }
       return
     }
 
@@ -1006,36 +1165,27 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
 
     // POST /activate/prepare — validate and cache activation without entering the app
     if (req.method === 'POST' && url.pathname === '/activate/prepare') {
-      const chunks = []
-      req.on('data', chunk => chunks.push(chunk))
-      req.on('end', async () => {
-        try {
-          const body = Buffer.concat(chunks).toString('utf-8')
-          const { apiKey, model, provider, baseURL } = JSON.parse(body || '{}')
-          const info = await prepareLLMActivation({ provider, apiKey, model, baseURL })
-          const pending = storePreparedActivation({ apiKey, info })
-          jsonResponse(res, 200, {
-            ok: true,
-            token: pending.token,
-            ...publicActivationInfo(info),
-            agent_name: getAgentName(),
-            expiresAt: pending.expiresAt,
-          })
-        } catch (err) {
-          jsonResponse(res, 400, { ok: false, error: err.message })
-        }
-      })
+      try {
+        const { apiKey, model, provider, baseURL } = await readJsonBody(req)
+        const info = await prepareLLMActivation({ provider, apiKey, model, baseURL })
+        const pending = storePreparedActivation({ apiKey, info })
+        jsonResponse(res, 200, {
+          ok: true,
+          token: pending.token,
+          ...publicActivationInfo(info),
+          agent_name: getAgentName(),
+          expiresAt: pending.expiresAt,
+        })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message })
+      }
       return
     }
 
     // POST /activate — submit API key to complete activation
     if (req.method === 'POST' && url.pathname === '/activate') {
-      const chunks = []
-      req.on('data', chunk => chunks.push(chunk))
-      req.on('end', async () => {
-        try {
-          const body = Buffer.concat(chunks).toString('utf-8')
-          const { apiKey, model, provider, baseURL, agentName, preparedToken } = JSON.parse(body || '{}')
+      try {
+          const { apiKey, model, provider, baseURL, agentName, preparedToken } = await readJsonBody(req)
 
           const trimmedName = validateAgentName(agentName)
 
@@ -1061,10 +1211,9 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
             try { onActivatedCallback() } catch (err) { console.error('[API] onActivated callback error:', err) }
           }
           jsonResponse(res, 200, { ok: true, ...info, agent_name: getAgentName() })
-        } catch (err) {
-          jsonResponse(res, 400, { ok: false, error: err.message })
-        }
-      })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message })
+      }
       return
     }
 
@@ -1082,7 +1231,7 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
           models: status.models,
           temperature: config.temperature,
           thinking: config.thinking === true,
-          apiKey: config.apiKey || '',
+          apiKeyConfigured: Boolean(config.apiKey),
         },
         providers: getProviderSummaries(),
         minimax: {
@@ -1095,72 +1244,56 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
 
     // POST /settings/agent-name — update the persisted display name
     if (req.method === 'POST' && url.pathname === '/settings/agent-name') {
-      const chunks = []
-      req.on('data', chunk => chunks.push(chunk))
-      req.on('end', () => {
-        try {
-          const { agentName, agent_name } = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
+      try {
+          const { agentName, agent_name } = await readJsonBody(req)
           const trimmedName = validateAgentName(agentName ?? agent_name)
           if (trimmedName) setConfig('agent_name', trimmedName)
           const name = getAgentName()
           setStickyEvent('agent_name_updated', { name })
           emitEvent('agent_name_updated', { name })
           jsonResponse(res, 200, { ok: true, agent_name: name })
-        } catch (err) {
-          jsonResponse(res, 400, { ok: false, error: err.message })
-        }
-      })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message })
+      }
       return
     }
 
     // POST /settings/model — switch model only (no need to re-enter the key)
     if (req.method === 'POST' && url.pathname === '/settings/model') {
-      const chunks = []
-      req.on('data', chunk => chunks.push(chunk))
-      req.on('end', async () => {
-        try {
-          const { provider, apiKey, model, baseURL } = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
+      try {
+          const { provider, apiKey, model, baseURL } = await readJsonBody(req)
           const result = provider || apiKey || baseURL
             ? await saveLLMSettings({ provider, apiKey, model, baseURL })
             : switchModel(model)
           emitEvent('model_switched', result)
           jsonResponse(res, 200, { ok: true, ...result })
-        } catch (err) {
-          jsonResponse(res, 400, { ok: false, error: err.message })
-        }
-      })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message })
+      }
       return
     }
 
     // POST /settings/temperature — set LLM temperature
     if (req.method === 'POST' && url.pathname === '/settings/temperature') {
-      const chunks = []
-      req.on('data', chunk => chunks.push(chunk))
-      req.on('end', () => {
-        try {
-          const { temperature } = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
+      try {
+          const { temperature } = await readJsonBody(req)
           const result = setTemperature(temperature)
           jsonResponse(res, 200, { ok: true, ...result })
-        } catch (err) {
-          jsonResponse(res, 400, { ok: false, error: err.message })
-        }
-      })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message })
+      }
       return
     }
 
     // POST /settings/thinking — toggle the model's thinking (reasoning) mode
     if (req.method === 'POST' && url.pathname === '/settings/thinking') {
-      const chunks = []
-      req.on('data', chunk => chunks.push(chunk))
-      req.on('end', () => {
-        try {
-          const { thinking } = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
+      try {
+          const { thinking } = await readJsonBody(req)
           const result = setThinking(thinking)
           jsonResponse(res, 200, { ok: true, ...result })
-        } catch (err) {
-          jsonResponse(res, 400, { ok: false, error: err.message })
-        }
-      })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message })
+      }
       return
     }
 
@@ -1174,20 +1307,16 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
     // POST /settings/security — save security sandbox configuration
     if (req.method === 'POST' && url.pathname === '/settings/security') {
       if (!requireLocalOrToken(req, res, url)) return
-      const chunks = []
-      req.on('data', chunk => chunks.push(chunk))
-      req.on('end', () => {
-        try {
-          const updates = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
+      try {
+          const updates = await readJsonBody(req)
           const result = setSecurity(updates)
           const network = Object.prototype.hasOwnProperty.call(updates, 'allowLanAccess')
             ? setNetworkConfig({ allowLanAccess: !!updates.allowLanAccess })
             : getNetworkConfig()
           jsonResponse(res, 200, { ok: true, security: result, network })
-        } catch (err) {
-          jsonResponse(res, 400, { ok: false, error: err.message })
-        }
-      })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message })
+      }
       return
     }
 
@@ -1199,11 +1328,8 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
 
     // POST /settings/social — save platform credentials and hot-restart affected connectors
     if (req.method === 'POST' && url.pathname === '/settings/social') {
-      const chunks = []
-      req.on('data', chunk => chunks.push(chunk))
-      req.on('end', async () => {
-        try {
-          const updates = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
+      try {
+          const updates = await readJsonBody(req)
           setSocialConfig(updates)
           // Restart the connector for each platform whose key was updated
           const PLATFORM_KEYS = {
@@ -1223,29 +1349,24 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
             )
           }
           jsonResponse(res, 200, { ok: true, social: getSocialConfig() })
-        } catch (err) {
-          jsonResponse(res, 400, { ok: false, error: err.message })
-        }
-      })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message })
+      }
       return
     }
 
     // POST /settings/minimax — set MiniMax API key
     if (req.method === 'POST' && url.pathname === '/settings/minimax') {
-      const chunks = []
-      req.on('data', chunk => chunks.push(chunk))
-      req.on('end', () => {
-        try {
-          const { apiKey } = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
+      try {
+          const { apiKey } = await readJsonBody(req)
           const trimmed = String(apiKey || '').trim()
           if (!trimmed) throw new Error('API key cannot be empty')
           setMinimaxKey(trimmed)
           replaceProvider(new MinimaxProvider({ apiKey: trimmed }))
           jsonResponse(res, 200, { ok: true, configured: true })
-        } catch (err) {
-          jsonResponse(res, 400, { ok: false, error: err.message })
-        }
-      })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message })
+      }
       return
     }
 
@@ -1468,17 +1589,13 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
 
     // POST /settings/voice — save voice configuration { whisperModel?, aliyunApiKey?, ... }
     if (req.method === 'POST' && url.pathname === '/settings/voice') {
-      const chunks = []
-      req.on('data', chunk => chunks.push(chunk))
-      req.on('end', () => {
-        try {
-          const body = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
-          setVoiceConfig(body)
-          jsonResponse(res, 200, { ok: true, voice: getVoiceConfig() })
-        } catch (err) {
-          jsonResponse(res, 400, { ok: false, error: err.message })
-        }
-      })
+      try {
+        const body = await readJsonBody(req)
+        setVoiceConfig(body)
+        jsonResponse(res, 200, { ok: true, voice: getVoiceConfig() })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message })
+      }
       return
     }
 
@@ -1490,17 +1607,13 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
 
     // POST /settings/tts — save TTS configuration
     if (req.method === 'POST' && url.pathname === '/settings/tts') {
-      const chunks = []
-      req.on('data', chunk => chunks.push(chunk))
-      req.on('end', () => {
-        try {
-          const body = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
-          setTTSConfig(body)
-          jsonResponse(res, 200, { ok: true, tts: getTTSConfig() })
-        } catch (err) {
-          jsonResponse(res, 400, { ok: false, error: err.message })
-        }
-      })
+      try {
+        const body = await readJsonBody(req)
+        setTTSConfig(body)
+        jsonResponse(res, 200, { ok: true, tts: getTTSConfig() })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message })
+      }
       return
     }
 
@@ -1512,17 +1625,13 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
 
     // POST /settings/web-search — save web search configuration
     if (req.method === 'POST' && url.pathname === '/settings/web-search') {
-      const chunks = []
-      req.on('data', chunk => chunks.push(chunk))
-      req.on('end', () => {
-        try {
-          const body = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
-          setWebSearchConfig(body)
-          jsonResponse(res, 200, { ok: true, webSearch: getWebSearchConfig() })
-        } catch (err) {
-          jsonResponse(res, 400, { ok: false, error: err.message })
-        }
-      })
+      try {
+        const body = await readJsonBody(req)
+        setWebSearchConfig(body)
+        jsonResponse(res, 200, { ok: true, webSearch: getWebSearchConfig() })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message })
+      }
       return
     }
 
@@ -1538,10 +1647,8 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
 
     // POST /settings/embedding — save embedding configuration
     if (req.method === 'POST' && url.pathname === '/settings/embedding') {
-      const chunks = []
-      for await (const chunk of req) chunks.push(chunk)
       try {
-        const body = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
+        const body = await readJsonBody(req)
         setEmbeddingConfig(body)
         // 写入配置后清掉 embedding 模块的 LRU 缓存（key 是 sha256(text+model)，model 变了旧缓存无效）
         try {
@@ -1550,7 +1657,7 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
         } catch {}
         jsonResponse(res, 200, { ok: true, embedding: getEmbeddingConfig() })
       } catch (err) {
-        jsonResponse(res, 400, { ok: false, error: err.message })
+        jsonResponse(res, err.statusCode || 400, { ok: false, error: err.message })
       }
       return
     }
@@ -1626,11 +1733,8 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
 
     // POST /tts/stream — streaming TTS synthesis, returns audio/mpeg stream
     if (req.method === 'POST' && url.pathname === '/tts/stream') {
-      const chunks = []
-      req.on('data', chunk => chunks.push(chunk))
-      req.on('end', async () => {
-        try {
-          const body = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
+      try {
+          const body = await readJsonBody(req)
           // 统一在合成入口剥 markdown：模型回复带 **加粗** 等记号时，TTS 会把星号念成"星星"
           const text = stripMarkdownForSpeech(body.text)
           if (!text) { jsonResponse(res, 400, { ok: false, error: 'Missing text parameter' }); return }
@@ -1638,6 +1742,7 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
           // 合成前预检：服务商未选/凭证未配齐时给出可执行引导，而非冲到 streamTTS 才裸抛
           const check = validateTTSConfig(creds)
           if (!check.ok) { jsonResponse(res, 400, { ok: false, error: check.guide, needsConfig: true, provider: check.provider }); return }
+          console.log(`[TTS] stream provider=${creds.provider} voice=${body.voiceId || creds.voiceId || ''} chars=${text.length}`)
           const audioStream = await streamTTS({
             text: text.slice(0, 800),
             provider: creds.provider,
@@ -1650,6 +1755,12 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
               doubaoStyle:   creds.doubaoStyle,
               doubaoSpeechRate: creds.doubaoSpeechRate,
               minimaxKey:    creds.minimaxKey,
+              baiduApiKey:    creds.baiduApiKey,
+              baiduSecretKey: creds.baiduSecretKey,
+              baiduCuid:      creds.baiduCuid,
+              baiduSpeed:     creds.baiduSpeed,
+              baiduPitch:     creds.baiduPitch,
+              baiduVolume:    creds.baiduVolume,
               openaiKey:     creds.openaiKey,
               openaiBaseURL: creds.openaiBaseURL,
               elevenLabsKey: creds.elevenLabsKey,
@@ -1692,31 +1803,26 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
               finishRes()
             }
           })
-        } catch (err) {
-          console.warn('[TTS] Streaming synthesis failed:', err.message)
-          if (!res.headersSent) jsonResponse(res, 500, { ok: false, error: err.message })
-          else try { res.end() } catch {}
-        }
-      })
+      } catch (err) {
+        console.warn('[TTS] Streaming synthesis failed:', err.message)
+        if (!res.headersSent) jsonResponse(res, err.statusCode || 500, { ok: false, error: err.message })
+        else try { res.end() } catch {}
+      }
       return
     }
 
     // POST /tts/interrupted — TTS interrupted by user; trim the last jarvis message to the spoken portion
     if (req.method === 'POST' && url.pathname === '/tts/interrupted') {
-      const chunks = []
-      req.on('data', chunk => chunks.push(chunk))
-      req.on('end', () => {
-        try {
-          const body = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
+      try {
+          const body = await readJsonBody(req)
           const { spokenContent } = body
           if (typeof spokenContent !== 'string') { jsonResponse(res, 400, { error: 'spokenContent required' }); return }
           const updated = updateLastJarvisConversationContent(spokenContent)
           emitEvent('tts_interrupted', { spokenContent })
           jsonResponse(res, 200, { ok: true, updated })
-        } catch (e) {
-          jsonResponse(res, 500, { error: e.message })
-        }
-      })
+      } catch (err) {
+        jsonResponse(res, err.statusCode || 500, { error: err.message })
+      }
       return
     }
 
@@ -1725,11 +1831,32 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
 
   // Cloud ASR WebSocket channel: frontend PCM → backend proxy → cloud ASR
   const cloudWss = new WebSocketServer({ noServer: true })
-  cloudWss.on('connection', (ws) => {
+  let activeVoiceWs = null
+  let activeVoiceClient = null
+  cloudWss.on('connection', (ws, req) => {
     let session = null
     let configured = false
+    let audioFrames = 0
+    let audioPeak = 0
+    let audioRmsAcc = 0
+    const startedAt = Date.now()
+    const remote = req?.socket?.remoteAddress || 'unknown'
+    const userAgent = String(req?.headers?.['user-agent'] || '')
+    const clientType = /Electron|Bailongma/i.test(userAgent) ? 'app' : 'web'
+    console.log(`[ASR] client connected from ${remote} type=${clientType}`)
+    if (activeVoiceWs && activeVoiceWs !== ws && activeVoiceWs.readyState === activeVoiceWs.OPEN) {
+      if (activeVoiceClient?.type === 'app' && clientType !== 'app') {
+        console.log('[ASR] rejecting web voice client because app voice client is active')
+        try { ws.close(4001, 'app voice client is active') } catch {}
+        return
+      }
+      console.log(`[ASR] closing previous voice client type=${activeVoiceClient?.type || 'unknown'}; only one ASR stream is allowed`)
+      try { activeVoiceWs.close(4000, 'replaced by a newer voice client') } catch {}
+    }
+    activeVoiceWs = ws
+    activeVoiceClient = { type: clientType, remote, startedAt }
 
-    ws.on('message', (raw) => {
+    ws.on('message', (raw, isBinary) => {
       // First frame must be a JSON config frame
       if (!configured) {
         try {
@@ -1739,17 +1866,24 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
           let rawCfg = {}
           try { rawCfg = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8'))?.voice || {} } catch {}
           const provider = rawCfg.voiceProvider || msg.provider || 'aliyun'
+          console.log(`[ASR] config provider=${provider} lang=${msg.lang || 'zh'} resource=${rawCfg.volcAsrResourceId || ''}`)
           session = createCloudASRSession(
             { provider, lang: msg.lang || 'zh', ...rawCfg },
             (text, isFinal, seg) => {
+              console.log(`[ASR] transcript final=${!!isFinal} seg=${seg || ''} text=${String(text || '').slice(0, 40)}`)
               try { ws.send(JSON.stringify({ type: 'transcript', text, is_final: isFinal, seg })) } catch {}
             },
             (errMsg) => {
+              console.warn(`[ASR] error: ${errMsg}`)
               try { ws.send(JSON.stringify({ type: 'error', message: errMsg })) } catch {}
             },
-            () => { try { ws.close() } catch {} },
+            () => {
+              console.log('[ASR] cloud session closed')
+              try { ws.close() } catch {}
+            },
             // onEvent：把云端非转录事件（task-started/finished/failed）转发到前端诊断
             (event, info) => {
+              console.log(`[ASR] cloud event=${event || ''} ${info || ''}`)
               try { ws.send(JSON.stringify({ type: 'diag', event, info })) } catch {}
             }
           )
@@ -1757,19 +1891,55 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
         } catch {}
         return
       }
-      // Subsequent frames are PCM binary
-      if (raw instanceof Buffer) {
-        session?.sendAudio(raw)
-      } else {
+      if (!isBinary) {
         try {
           const msg = JSON.parse(raw.toString())
-          if (msg.type === 'flush') session?.flush()
+          if (msg.type === 'flush') {
+            console.log(`[ASR] flush frames=${audioFrames}`)
+            session?.flush()
+          }
         } catch {}
+        return
+      }
+      // Subsequent frames are PCM binary
+      if (raw instanceof Buffer) {
+        audioFrames++
+        let sum = 0
+        let peak = 0
+        for (let i = 0; i + 1 < raw.length; i += 2) {
+          const sample = raw.readInt16LE(i)
+          const abs = Math.abs(sample)
+          if (abs > peak) peak = abs
+          sum += sample * sample
+        }
+        const count = Math.max(1, Math.floor(raw.length / 2))
+        const rms = Math.sqrt(sum / count)
+        if (peak > audioPeak) audioPeak = peak
+        audioRmsAcc += rms
+        if (audioFrames === 1 || audioFrames % 50 === 0) {
+          const avgRms = audioRmsAcc / audioFrames
+          console.log(`[ASR] audio frames=${audioFrames} lastBytes=${raw.byteLength} rms=${rms.toFixed(0)} avgRms=${avgRms.toFixed(0)} peak=${audioPeak}`)
+        }
+        session?.sendAudio(raw)
       }
     })
 
-    ws.on('close', () => { session?.close(); session = null })
-    ws.on('error', () => { session?.close(); session = null })
+    ws.on('close', () => {
+      console.log(`[ASR] client closed frames=${audioFrames} durationMs=${Date.now() - startedAt}`)
+      if (activeVoiceWs === ws) {
+        activeVoiceWs = null
+        activeVoiceClient = null
+      }
+      session?.close(); session = null
+    })
+    ws.on('error', (err) => {
+      console.warn(`[ASR] client socket error: ${err?.message || err}`)
+      if (activeVoiceWs === ws) {
+        activeVoiceWs = null
+        activeVoiceClient = null
+      }
+      session?.close(); session = null
+    })
   })
 
   // ACUI WebSocket channel: bidirectional control + perception

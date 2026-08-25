@@ -56,6 +56,13 @@ export function initVoicePanel({
     btn?.classList.toggle('active', core.micActive || core.userWantedMic);
   });
 
+  // Canonical interaction state is observable by the rest of the UI and by
+  // integrations without coupling them to the point-cloud's visual states.
+  const publishVoiceState = (event) => {
+    window.dispatchEvent(new CustomEvent('bailongma:voice-state', { detail: event }));
+  };
+  core.subscribeVoiceState(publishVoiceState);
+
   // ─── 承重墙：window.bailongmaVoice 接口契约（app.js 依赖，不可改形状） ───
   window.bailongmaVoice = {
     isActive: () => core.micActive,
@@ -70,6 +77,13 @@ export function initVoicePanel({
     },
     stop: () => core.stopSession(),
     setTTSAnalyser: (analyser) => core.setTTSAnalyser(analyser),
+    getState: () => core.getVoiceState(),
+    getVoiceState: () => core.getVoiceState(),
+    setAgentState: (state, options = {}) => core.setVoiceState(state, {
+      ...options,
+      meta: { ...(options.meta || {}), source: 'agent' },
+    }),
+    subscribeState: (listener) => core.subscribeVoiceState(listener),
     pttStart: ptt.pttStart,
     pttEnd: ptt.pttEnd,
   };
@@ -100,6 +114,7 @@ export function initVoicePanel({
   canvas.addEventListener('click', toggleVoice);
 
   core.setStatus('idle');
+  publishVoiceState(core.getVoiceState());
   openPanel();
   if (getAutoMic?.()) toggleVoice();
 }

@@ -867,7 +867,6 @@ export function getProviderSummaries() {
       models: pConfig.models,
       defaultModel: pConfig.defaultModel,
       configured: !!stored,
-      apiKey: stored?.apiKey || '',
       model: stored?.model ? normalizeModel(stored.model, name) : pConfig.defaultModel,
     }
     })(),
@@ -878,7 +877,6 @@ export function getProviderSummaries() {
     models: [],
     defaultModel: '',
     configured: !!custom,
-    apiKey: custom?.apiKey || '',
     model: custom?.model || '',
     baseURL: custom?.baseURL || '',
   }
@@ -1202,6 +1200,7 @@ export function setSocialConfig(updates) {
 const VOICE_CONFIG_KEYS = [
   'voiceProvider',
   'aliyunApiKey',
+  'baiduAsrMode', 'baiduAsrAppId', 'baiduAsrApiKey', 'baiduAsrSecretKey', 'baiduAsrDevPid', 'baiduAsrCuid', 'baiduAsrLmId', 'baiduAsrUser',
   'tencentSecretId', 'tencentSecretKey', 'tencentAppId',
   'xunfeiAppId', 'xunfeiApiKey', 'xunfeiApiSecret',
   'volcAsrApiKey', 'volcAsrAppKey', 'volcAsrAccessKey', 'volcAsrResourceId',
@@ -1227,6 +1226,9 @@ export function getVoiceConfig() {
   for (const key of VOICE_CONFIG_KEYS) {
     if (key === 'voiceProvider') continue
     result[key] = { configured: !!(stored[key]) }
+    if (['baiduAsrMode', 'baiduAsrAppId', 'baiduAsrDevPid', 'baiduAsrCuid', 'baiduAsrLmId', 'baiduAsrUser'].includes(key)) {
+      result[key] = { configured: !!(stored[key]), value: stored[key] || '' }
+    }
     if (key === 'aliyunApiKey' && stored[key]) {
       result[key] = {
         configured: isValidAliyunAsrKey(stored[key]),
@@ -1269,6 +1271,7 @@ const TTS_CONFIG_KEYS = [
   'ttsProvider', 'ttsVoiceId',
   'minimaxKey',
   'doubaoKey', 'doubaoAppId', 'doubaoAccessKey', 'doubaoResourceId', 'doubaoStyle', 'doubaoSpeechRate',
+  'baiduApiKey', 'baiduSecretKey', 'baiduCuid', 'baiduSpeed', 'baiduPitch', 'baiduVolume',
   'openaiTtsKey', 'openaiTtsBaseURL',
   'elevenLabsKey',
   'volcanoAppId', 'volcanoToken',
@@ -1287,6 +1290,12 @@ export function getTTSConfig() {
     doubaoResourceId: stored.doubaoResourceId || '',
     doubaoStyle:     stored.doubaoStyle || '',
     doubaoSpeechRate: Number(stored.doubaoSpeechRate || 0) || 0,
+    baiduApiKey:      { configured: !!(stored.baiduApiKey) },
+    baiduSecretKey:   { configured: !!(stored.baiduSecretKey) },
+    baiduCuid:        stored.baiduCuid || '',
+    baiduSpeed:       Number(stored.baiduSpeed ?? 5) || 5,
+    baiduPitch:       Number(stored.baiduPitch ?? 5) || 5,
+    baiduVolume:      Number(stored.baiduVolume ?? 5) || 5,
     openaiTtsBaseURL: stored.openaiTtsBaseURL || '',
     openaiTtsKey:    { configured: !!(stored.openaiTtsKey) },
     elevenLabsKey:   { configured: !!(stored.elevenLabsKey) },
@@ -1308,6 +1317,12 @@ export function getTTSCredentials() {
     doubaoResourceId: stored.doubaoResourceId || process.env.DOUBAO_TTS_RESOURCE_ID || '',
     doubaoStyle:    stored.doubaoStyle || process.env.DOUBAO_TTS_STYLE || '',
     doubaoSpeechRate: Number(stored.doubaoSpeechRate ?? process.env.DOUBAO_TTS_SPEECH_RATE ?? 0) || 0,
+    baiduApiKey:     stored.baiduApiKey || process.env.BAIDU_TTS_API_KEY || '',
+    baiduSecretKey:  stored.baiduSecretKey || process.env.BAIDU_TTS_SECRET_KEY || '',
+    baiduCuid:       stored.baiduCuid || process.env.BAIDU_TTS_CUID || 'bailongma',
+    baiduSpeed:      Number(stored.baiduSpeed ?? process.env.BAIDU_TTS_SPEED ?? 5) || 5,
+    baiduPitch:      Number(stored.baiduPitch ?? process.env.BAIDU_TTS_PITCH ?? 5) || 5,
+    baiduVolume:     Number(stored.baiduVolume ?? process.env.BAIDU_TTS_VOLUME ?? 5) || 5,
     minimaxKey:     process.env.MINIMAX_API_KEY || stored.minimaxKey || getMinimaxKey() || (config.provider === 'minimax' ? config.apiKey : '') || '',
     openaiKey:      stored.openaiTtsKey  || '',
     openaiBaseURL:  stored.openaiTtsBaseURL || '',

@@ -1,10 +1,11 @@
 // 流式 TTS 服务商接入层
-// 支持: OpenAI TTS / ElevenLabs / 火山引擎 / 豆包（方舟）
+// 支持: OpenAI TTS / ElevenLabs / 火山引擎 / 豆包（方舟）/ 百度
 // 统一返回 Node.js Readable stream，供 api.js pipe 到 HTTP 响应
 import { Readable, Transform } from 'stream'
 
 export const TTS_PROVIDERS = [
   { id: 'doubao',      label: '豆包（方舟）',   streaming: true  },
+  { id: 'baidu',       label: '百度智能云',     streaming: false },
   { id: 'minimax',     label: 'MiniMax',       streaming: false },
   { id: 'openai',      label: 'OpenAI TTS',   streaming: true  },
   { id: 'elevenlabs',  label: 'ElevenLabs',   streaming: true  },
@@ -21,6 +22,22 @@ export const TTS_VOICES = {
     { id: 'zh_male_m191_uranus_bigtts',              label: '云舟 2.0（男声，通用）' },
     { id: 'zh_male_taocheng_uranus_bigtts',          label: '小天 2.0（男声，通用）' },
     { id: 'zh_female_kefunvsheng_uranus_bigtts',     label: '暖阳女声 2.0（客服）' },
+  ],
+  baidu: [
+    { id: '0',     label: '度小美（女声，基础）' },
+    { id: '1',     label: '度小宇（男声，基础）' },
+    { id: '3',     label: '度逍遥（男声，基础）' },
+    { id: '4',     label: '度丫丫（女声，基础）' },
+    { id: '5003',  label: '度逍遥（男声，精品）' },
+    { id: '5118',  label: '度小鹿（女声，精品）' },
+    { id: '106',   label: '度博文（男声，精品）' },
+    { id: '110',   label: '度小童（童声，精品）' },
+    { id: '111',   label: '度小萌（女声，精品）' },
+    { id: '103',   label: '度米朵（女声，精品）' },
+    { id: '5',     label: '度小娇（女声，精品）' },
+    { id: '4100',  label: '度小雯（女声，臻品）' },
+    { id: '4106',  label: '度博文（男声，臻品）' },
+    { id: '4149',  label: '度星河（男声，臻品）' },
   ],
   minimax: [
     { id: 'male-qn-qingse',    label: '青涩男声' },
@@ -70,6 +87,14 @@ export const TTS_PROVIDER_REQUIREMENTS = {
     groups: [{ keys: ['doubaoAccessKey', 'doubaoKey'], label: 'Access Key 或 API Key' }],
     guide: '请在「语音设置 → 语音合成」里选择豆包，并填入控制台的语音合成 Access Key（或 API Key）。',
   },
+  baidu: {
+    label: '百度智能云',
+    groups: [
+      { keys: ['baiduApiKey'], label: 'API Key' },
+      { keys: ['baiduSecretKey'], label: 'Secret Key' },
+    ],
+    guide: '请在「语音设置 → 语音合成」里选择百度智能云，并填写语音技术应用的 API Key 和 Secret Key。',
+  },
   minimax: {
     label: 'MiniMax',
     groups: [{ keys: ['minimaxKey'], label: 'API Key' }],
@@ -104,7 +129,7 @@ export function validateTTSConfig(creds = {}) {
     return {
       ok: false,
       provider,
-      guide: `还没选择有效的语音合成服务商（当前：${provider || '空'}）。请在「语音设置 → 语音合成」里选择豆包 / MiniMax / OpenAI / ElevenLabs / 火山引擎 其中之一。`,
+      guide: `还没选择有效的语音合成服务商（当前：${provider || '空'}）。请在「语音设置 → 语音合成」里选择豆包 / 百度智能云 / MiniMax / OpenAI / ElevenLabs / 火山引擎 其中之一。`,
     }
   }
   const missing = req.groups
@@ -272,6 +297,80 @@ async function streamMiniMax({ text, voiceId = 'male-qn-qingse', apiKey }) {
   return Readable.from([buf])
 }
 
+// ── 百度智能云 TTS ──────────────────────────────────────────────────────────
+// 文档: https://ai.baidu.com/ai-doc/SPEECH/mlbxh7xie
+// 认证: API Key + Secret Key 换 access_token
+// 返回: audio/mp3，错误时返回 JSON
+let baiduTokenCache = { key: '', token: '', expiresAt: 0 }
+
+async function getBaiduAccessToken(apiKey, secretKey) {
+  const cacheKey = `${apiKey}:${secretKey}`
+  const now = Date.now()
+  if (baiduTokenCache.key === cacheKey && baiduTokenCache.token && baiduTokenCache.expiresAt > now + 60_000) {
+    return baiduTokenCache.token
+  }
+  const params = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: apiKey,
+    client_secret: secretKey,
+  })
+  const resp = await fetch('https://aip.baidubce.com/oauth/2.0/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params,
+  })
+  const data = await resp.json().catch(() => ({}))
+  if (!resp.ok || !data?.access_token) {
+    throw new Error(`百度 TTS: 获取 access_token 失败 (${resp.status}): ${JSON.stringify(data).slice(0, 300)}`)
+  }
+  const expiresIn = Number(data.expires_in || 0)
+  baiduTokenCache = {
+    key: cacheKey,
+    token: data.access_token,
+    expiresAt: now + Math.max(60, expiresIn - 300) * 1000,
+  }
+  return data.access_token
+}
+
+async function streamBaidu({
+  text,
+  voiceId = '0',
+  apiKey,
+  secretKey,
+  cuid = 'bailongma',
+  speed = 5,
+  pitch = 5,
+  volume = 5,
+}) {
+  if (!apiKey || !secretKey) throw new Error('百度 TTS: 缺少 API Key 或 Secret Key，请在设置中填写')
+  const token = await getBaiduAccessToken(apiKey, secretKey)
+  const params = new URLSearchParams({
+    tex: text,
+    tok: token,
+    cuid: cuid || 'bailongma',
+    ctp: '1',
+    lan: 'zh',
+    spd: String(Math.max(0, Math.min(15, Math.round(Number(speed) || 5)))),
+    pit: String(Math.max(0, Math.min(15, Math.round(Number(pitch) || 5)))),
+    vol: String(Math.max(0, Math.min(15, Math.round(Number(volume) || 5)))),
+    per: String(voiceId || '0'),
+    aue: '3',
+  })
+  const resp = await fetch('https://tsn.baidu.com/text2audio', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params,
+  })
+  const contentType = resp.headers.get('content-type') || ''
+  const buf = Buffer.from(await resp.arrayBuffer())
+  if (!resp.ok || contentType.includes('application/json') || /^\s*\{/.test(buf.toString('utf-8', 0, Math.min(buf.length, 20)))) {
+    const errText = buf.toString('utf-8').slice(0, 300)
+    throw new Error(`百度 TTS 失败 (${resp.status}): ${errText}`)
+  }
+  if (!buf.length) throw new Error('百度 TTS: 响应中无音频数据')
+  return Readable.from([buf])
+}
+
 // ── OpenAI TTS ─────────────────────────────────────────────────────────────
 // 价格: tts-1 $0.015/千字，tts-1-hd $0.030/千字
 // 流式: 是（HTTP chunked），首字节延迟约 200-400ms
@@ -383,6 +482,17 @@ export async function streamTTS({ text, provider, voiceId, keys = {} }) {
       })
     case 'minimax':
       return streamMiniMax({ text, voiceId, apiKey: keys.minimaxKey })
+    case 'baidu':
+      return streamBaidu({
+        text,
+        voiceId,
+        apiKey: keys.baiduApiKey,
+        secretKey: keys.baiduSecretKey,
+        cuid: keys.baiduCuid,
+        speed: keys.baiduSpeed,
+        pitch: keys.baiduPitch,
+        volume: keys.baiduVolume,
+      })
     case 'openai':
       return streamOpenAI({ text, voiceId, apiKey: keys.openaiKey, baseURL: keys.openaiBaseURL })
     case 'elevenlabs':

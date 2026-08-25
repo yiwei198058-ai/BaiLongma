@@ -6,6 +6,7 @@ import { HotspotEarth } from './hotspot-earth.js';
 // ── 实时热点数据由后端 /hotspots 提供；前端不再用 mock 冒充真实热榜 ─────────────
 
 const PLATFORM_CONFIG = {
+  ai: { listId: 'hs-ai-list', updateId: 'hs-ai-update', style: 'label', label: 'AI人工智能' },
   douyin: { listId: 'hs-douyin-list', updateId: 'hs-douyin-update', style: 'heat', label: '抖音' },
   xiaohongshu: { listId: 'hs-xhs-list', updateId: 'hs-xhs-update', style: 'heat', label: '小红书' },
   wechat: { listId: 'hs-wechat-list', updateId: 'hs-wechat-update', style: 'label', label: '微信热点' },
@@ -13,35 +14,16 @@ const PLATFORM_CONFIG = {
 };
 
 const hotspotLists = {
+  ai: [],
   douyin: [],
   xiaohongshu: [],
   wechat: [],
   weibo: [],
 };
 
-// 实时事件流卡片
-const MOCK_FEED = [
-  { time:'19:25', cat:'自然灾害', catColor:'#e05c5c', title:'四川宜宾县发生6.0级地震', desc:'震源深度10公里，暂无人员伤亡报告，救援力量已巡查到达震源周边', loc:'中国·四川', img:'' },
-  { time:'19:24', cat:'科技',     catColor:'#5c9ee0', title:'神舟十八号发射任务圆满成功', desc:'载人飞船与空间站组合体成功对接，状态良好。', loc:'酒泉卫星发射中心', img:'' },
-  { time:'19:23', cat:'财经',     catColor:'#c97d30', title:'特斯拉全球召回超110万辆汽车', desc:'涉及安全带及软件问题，特斯拉免费修复。', loc:'全球', img:'' },
-  { time:'19:22', cat:'体育',     catColor:'#4eaa6e', title:'巴黎奥运圣火抵达马赛港', desc:'开幕式倒计时启动，法国全境传递沿线盛况空前，7月26日开幕。', loc:'法国·马赛', img:'' },
-  { time:'19:21', cat:'社会',     catColor:'#9b6bc4', title:'台风"玛莉亚"逼近东南沿海', desc:'预计26日凌晨在浙江登陆，多地发布台风橙色预警，船只回港避险。', loc:'中国·东南沿海', img:'' },
-  { time:'19:19', cat:'科技',     catColor:'#5c9ee0', title:'华为发布全新 AI 芯片', desc:'性能较上代提升60%，将首批搭载于旗舰产品线，引发行业广泛关注。', loc:'中国·深圳', img:'' },
-  { time:'19:18', cat:'政策',     catColor:'#6bbfbf', title:'欧盟正式通过 AI 监管法案', desc:'《人工智能法案》生效，将对高风险AI系统实施强制合规审查。', loc:'比利时·布鲁塞尔', img:'' },
-  { time:'19:17', cat:'旅游',     catColor:'#c4a030', title:'多地景区迎来客流高峰', desc:'暑期旅游热度持续攀升，热门景区单日接待游客超历史纪录。', loc:'中国多地', img:'' },
-];
-
-// 底部跑马灯文字
-const TICKER_ITEMS = [
-  { time:'19:20', text:'上海发布高温红色预警，气温预计突破40℃' },
-  { time:'19:19', text:'全球芯片市场半年年报告发布，亚太份额持续上升' },
-  { time:'19:18', text:'欧盟通过 AI 法案，将对高风险系统强制审查' },
-  { time:'19:17', text:'多地景区迎来客流高峰，暑运旅游市场表现亮眼' },
-  { time:'19:16', text:'国际油价小幅上涨，布伦特原油突破85美元/桶' },
-  { time:'19:15', text:'A股午后强势拉升，沪指收涨1.24%，科技板块领涨' },
-  { time:'19:14', text:'北京时间明日凌晨2点：欧洲杯决赛，全球直播' },
-  { time:'19:13', text:'研究显示：今夏北半球平均气温创历史新高' },
-];
+// 实时事件流卡片：只显示后端真实新闻源返回的条目。未接入真实源时不再展示演示时间。
+let liveFeedItems = [];
+let situationAnalysis = null;
 
 // ── 热点上下文构建（中性系统上下文，不强制 Agent 回复）──────────────────────────
 
@@ -50,12 +32,15 @@ let hotspotMeta = {
   fetchedAt: null,
   stale: true,
   refreshMinutes: 30,
+  newsRefreshMinutes: 20,
+  analysisRefreshHours: 6,
   status: {},
+  liveFeedMeta: {},
 };
 
 export function buildHotspotContext() {
   const top = (arr, n) => arr.slice(0, n).map((i, idx) => `${idx + 1}. ${i.text}`).join('；');
-  const feedTop = MOCK_FEED.slice(0, 3).map(i => `[${i.cat}] ${i.title}`).join('；');
+  const feedTop = liveFeedItems.slice(0, 3).map(i => `[${i.cat}] ${i.title}`).join('；');
   const platformText = Object.entries(PLATFORM_CONFIG)
     .map(([platform, config]) => {
       const items = hotspotLists[platform] || [];
@@ -78,7 +63,7 @@ export function buildHotspotContext() {
 ${sourceText}
 
 ${platformText || '当前暂无可用实时热榜。'}
-实时事件 Top3：${feedTop}`;
+实时事件 Top3：${feedTop || '真实新闻源未接入，暂无实时事件。'}`;
 }
 
 // ── 状态 ──────────────────────────────────────────────────────────────────────
@@ -192,6 +177,48 @@ function setText(id, text) {
   if (el) el.textContent = text;
 }
 
+function setClass(id, className) {
+  const el = $(id);
+  if (el) el.className = className;
+}
+
+function renderSituation() {
+  renderRegionAttention(situationAnalysis?.regionAttention || []);
+  renderSentiment(situationAnalysis?.sentiment || null);
+}
+
+function renderRegionAttention(items = []) {
+  const el = $('hs-region-list');
+  if (!el) return;
+  const list = Array.isArray(items) ? items.slice(0, 6) : [];
+  if (!list.length) {
+    el.innerHTML = `<div class="hs-region-empty">等待真实热点样本生成区域关注度</div>`;
+    return;
+  }
+  el.innerHTML = list.map((item) => {
+    const value = Math.max(0, Math.min(100, Math.round(Number(item.value ?? item.score ?? item.percent ?? 0))));
+    return `<div class="hs-region-row">
+      <span class="hs-region-name">${escapeHtml(item.name || '未命名')}</span>
+      <div class="hs-bar-track"><div class="hs-bar-fill" style="width:${value}%"></div></div>
+      <span class="hs-region-pct">${value}%</span>
+    </div>`;
+  }).join('');
+}
+
+function renderSentiment(sentiment) {
+  const score = Math.max(0, Math.min(100, Math.round(Number(sentiment?.score))));
+  const hasScore = Number.isFinite(score);
+  const value = hasScore ? score : 0;
+  const circumference = 150.8;
+  const arc = $('hs-sentiment-arc');
+  if (arc) arc.setAttribute('stroke-dashoffset', String(circumference * (1 - value / 100)));
+  setText('hs-sentiment-num', hasScore ? String(value) : '--');
+  setText('hs-sentiment-text', sentiment?.label || '等待分析');
+  const deltaText = sentiment?.delta || `${hotspotMeta.analysisRefreshHours || 6}小时缓存`;
+  setText('hs-sentiment-delta', deltaText);
+  setClass('hs-sentiment-delta', `hs-sentiment-delta ${value >= 58 ? 'hs-delta-up' : value <= 42 ? 'hs-delta-down' : ''}`.trim());
+}
+
 function updateHotspotMeta() {
   let total = 0;
   for (const [platform, config] of Object.entries(PLATFORM_CONFIG)) {
@@ -204,7 +231,14 @@ function updateHotspotMeta() {
     setText(config.updateId, `${source} · ${formatFetchedAt(hotspotMeta.fetchedAt)}`);
   }
   setText('hs-stat-data', String(total));
-  setText('hs-stat-data-delta', `四平台热榜 / ${hotspotMeta.refreshMinutes || 30} 分钟缓存`);
+  setText('hs-stat-data-delta', `热榜${hotspotMeta.refreshMinutes || 30}分 / 新闻${hotspotMeta.newsRefreshMinutes || 20}分`);
+  const stats = situationAnalysis?.stats || {};
+  setText('hs-stat-alert', Number.isFinite(Number(stats.alerts)) ? String(stats.alerts) : '--');
+  setText('hs-stat-alert-delta', stats.alertsDelta || '真实源规则计算');
+  setText('hs-stat-hot', Number.isFinite(Number(stats.highAttention)) ? String(stats.highAttention) : '--');
+  setText('hs-stat-hot-delta', stats.highAttentionDelta || '等待态势样本');
+  setText('hs-stat-ai', Number.isFinite(Number(stats.confidence)) ? `${stats.confidence}%` : '--');
+  setText('hs-stat-ai-delta', stats.confidenceDelta || `${hotspotMeta.analysisRefreshHours || 6}小时态势缓存`);
 }
 
 async function refreshHotspots({ force = false } = {}) {
@@ -227,9 +261,19 @@ async function refreshHotspots({ force = false } = {}) {
       fetchedAt: data.fetchedAt,
       stale: !!data.stale,
       refreshMinutes: data.refreshMinutes || 30,
+      newsRefreshMinutes: data.newsRefreshMinutes || data.liveFeedMeta?.refreshMinutes || 20,
+      analysisRefreshHours: data.analysisRefreshHours || data.situationAnalysis?.refreshHours || 6,
       status: data.status || {},
+      liveFeedMeta: data.liveFeedMeta || {},
     };
+    liveFeedItems = Array.isArray(data.liveFeed)
+      ? data.liveFeed.map(normalizeLiveFeedItem).filter(Boolean).slice(0, 12)
+      : [];
+    situationAnalysis = data.situationAnalysis || null;
     renderAllLists();
+    renderSituation();
+    renderFeed();
+    renderTicker();
     updateHotspotMeta();
   } catch (err) {
     hotspotMeta = {
@@ -260,19 +304,64 @@ const CAT_COLORS = {
   '体育':'#4eaa6e', '社会':'#9b6bc4', '政策':'#6bbfbf', '旅游':'#c4a030',
 };
 
+function escapeHtml(value = '') {
+  return String(value).replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[ch]));
+}
+
+function formatPublishedTime(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function normalizeLiveFeedItem(item = {}) {
+  const title = String(item.title || item.text || '').trim();
+  const publishedAt = item.publishedAt || item.published_at || item.time || item.timestamp || '';
+  const time = formatPublishedTime(publishedAt);
+  if (!title || !time) return null;
+  return {
+    time,
+    cat: String(item.cat || item.category || '新闻').trim(),
+    catColor: item.catColor || item.color || '',
+    title,
+    desc: String(item.desc || item.summary || item.description || '').trim(),
+    loc: String(item.loc || item.location || item.source || '').trim(),
+  };
+}
+
 function renderFeed() {
   const track = $('hs-feed-track');
   if (!track) return;
-  track.innerHTML = MOCK_FEED.map((item) => {
+  if (!liveFeedItems.length) {
+    track.innerHTML = `<div class="hs-feed-card hs-feed-empty">
+      <div class="hs-feed-card-top">
+        <span class="hs-feed-time">--:--</span>
+        <span class="hs-feed-cat" style="background:#5c9ee022;color:#8fb6d8;border-color:#8fb6d844">待接入</span>
+      </div>
+      <div class="hs-feed-title">真实新闻源未接入</div>
+      <div class="hs-feed-desc">接入新闻源并返回 publishedAt 后，这里才显示真实发布时间。</div>
+      <div class="hs-feed-loc">📍 实时新闻</div>
+    </div>`;
+    return;
+  }
+  track.innerHTML = liveFeedItems.map((item) => {
     const color = item.catColor || CAT_COLORS[item.cat] || '#8fb6d8';
     return `<div class="hs-feed-card">
       <div class="hs-feed-card-top">
-        <span class="hs-feed-time">${item.time}</span>
-        <span class="hs-feed-cat" style="background:${color}22;color:${color};border-color:${color}44">${item.cat}</span>
+        <span class="hs-feed-time">${escapeHtml(item.time)}</span>
+        <span class="hs-feed-cat" style="background:${color}22;color:${color};border-color:${color}44">${escapeHtml(item.cat)}</span>
       </div>
-      <div class="hs-feed-title">${item.title}</div>
-      <div class="hs-feed-desc">${item.desc}</div>
-      <div class="hs-feed-loc">📍 ${item.loc}</div>
+      <div class="hs-feed-title">${escapeHtml(item.title)}</div>
+      <div class="hs-feed-desc">${escapeHtml(item.desc)}</div>
+      <div class="hs-feed-loc">📍 ${escapeHtml(item.loc || '新闻源')}</div>
     </div>`;
   }).join('');
 }
@@ -307,8 +396,11 @@ function stopFeedAuto() {
 function renderTicker() {
   const el = $('hs-ticker-inner');
   if (!el) return;
-  const html = TICKER_ITEMS.map(
-    ({ time, text }) => `<span class="hs-ticker-item"><span class="hs-ticker-time">${time}</span>${text}</span>`
+  const items = liveFeedItems.length
+    ? liveFeedItems.map(({ time, title }) => ({ time, text: title }))
+    : [{ time: '--:--', text: '真实新闻源未接入，等待 publishedAt 后显示实时新闻' }];
+  const html = items.map(
+    ({ time, text }) => `<span class="hs-ticker-item"><span class="hs-ticker-time">${escapeHtml(time)}</span>${escapeHtml(text)}</span>`
   ).join('<span class="hs-ticker-sep">●</span>');
   // 翻倍内容实现无缝
   el.innerHTML = html + '<span class="hs-ticker-sep">●</span>' + html;

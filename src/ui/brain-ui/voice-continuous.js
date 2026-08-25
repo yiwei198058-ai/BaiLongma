@@ -28,6 +28,10 @@ const BARGEIN_FAST_SILENT_THR  = BARGEIN_THRESHOLD * 0.65;
 const BARGEIN_FAST_SILENT_NEED = 7;
 
 const BARGEIN_NO_SPEECH_MS = 3500; // 3.5s 内没有识别到语音 → 视为误触发
+const BAIDU_REST_SPEECH_VOL = 0.10;
+const BAIDU_REST_SILENCE_MS = 1400;
+const BAIDU_REST_MIN_SPEECH_MS = 900;
+const BAIDU_REST_MAX_SEGMENT_MS = 12000;
 
 export function createContinuousPolicy(core, { getAutoSend }) {
   // ─── 自动发送状态 ───
@@ -41,7 +45,35 @@ export function createContinuousPolicy(core, { getAutoSend }) {
   // 最近一次「转写文本发生变化」的时间戳。自动发送只看它；麦克风音量不参与重置。
   let lastTranscriptActivityTs = 0;
   let lastObservedTranscriptText = '';
+  let baiduRestSpeaking = false;
+  let baiduRestFirstSpeechTs = 0;
+  let baiduRestLastSpeechTs = 0;
+  let baiduRestFlushTimer = null;
   function noteTranscriptActivity() { lastTranscriptActivityTs = Date.now(); }
+
+  function clearBaiduRestFlushTimer() {
+    if (baiduRestFlushTimer) {
+      clearTimeout(baiduRestFlushTimer);
+      baiduRestFlushTimer = null;
+    }
+  }
+
+  function resetBaiduRestSegment() {
+    baiduRestSpeaking = false;
+    baiduRestFirstSpeechTs = 0;
+    baiduRestLastSpeechTs = 0;
+    clearBaiduRestFlushTimer();
+  }
+
+  function flushBaiduRestSegment() {
+    if (!baiduRestSpeaking || !core.micActive || core.suspendedByMedia || core.pttHolding) return;
+    if (Date.now() - baiduRestFirstSpeechTs < BAIDU_REST_MIN_SPEECH_MS) {
+      resetBaiduRestSegment();
+      return;
+    }
+    resetBaiduRestSegment();
+    core.flushAsr();
+  }
 
   // ─── 打断检测状态 ───
   let bargeinFrames = 0;       // 阶段一：等待触发 duck 的高振幅帧计数
@@ -194,6 +226,24 @@ export function createContinuousPolicy(core, { getAutoSend }) {
     }
 
     // 自动发送不在这里看音量。底噪/回声/呼吸声只能影响打断检测和视觉反馈，不能重置发送计时。
+    // 百度短语音 REST 不是实时流式识别：必须在一段话说完后 flush 才会返回文字。
+    // 常开模式没有 transcript 就无法触发原来的自动发送，所以这里按"有声→静音"切段。
+    if (core.isBaiduRestMode?.() && core.micActive && !core.suspendedByMedia && !core.pttHolding) {
+      const now = Date.now();
+      if (vol >= BAIDU_REST_SPEECH_VOL) {
+        if (!baiduRestSpeaking) baiduRestFirstSpeechTs = now;
+        baiduRestSpeaking = true;
+        baiduRestLastSpeechTs = now;
+        clearBaiduRestFlushTimer();
+        if (now - baiduRestFirstSpeechTs >= BAIDU_REST_MAX_SEGMENT_MS) {
+          baiduRestFlushTimer = setTimeout(flushBaiduRestSegment, 0);
+        }
+      } else if (baiduRestSpeaking && now - baiduRestLastSpeechTs >= BAIDU_REST_SILENCE_MS && !baiduRestFlushTimer) {
+        baiduRestFlushTimer = setTimeout(flushBaiduRestSegment, 80);
+      }
+    } else {
+      resetBaiduRestSegment();
+    }
   }
 
   // ─── core 钩子：收到一条 transcript 后的策略 ───
@@ -220,6 +270,7 @@ export function createContinuousPolicy(core, { getAutoSend }) {
     resetEchoFloor();
     lastTranscriptActivityTs = 0;
     lastObservedTranscriptText = '';
+    resetBaiduRestSegment();
   }
 
   // ─── core 钩子：进入 TTS 挂起时重置打断检测计数 ───
@@ -229,6 +280,7 @@ export function createContinuousPolicy(core, { getAutoSend }) {
     duckHighFrames = 0;
     duckLowFrames = 0;
     resetEchoFloor();
+    resetBaiduRestSegment();
   }
 
   // ─── core 钩子：会话恢复时重置 / 启动续播计时 ───

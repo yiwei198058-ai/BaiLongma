@@ -45,10 +45,11 @@ import { tryAutoConfigureKey } from './key-auto-config.js'
 import { PRIMARY_USER_ID, formatPresenceForPrompt, normalizeChannel, isExternalChannel } from './identity.js'
 import { truncateToolResultForUI } from './runtime/tool-result-preview.js'
 import { buildLLMMessages } from './runtime/messages.js'
-import { parseMarkers } from './runtime/markers.js'
+import { parseMarkers, stripMarkers } from './runtime/markers.js'
 import { buildStrictEvaluationContext, filterStrictEvaluationTools, resolveStrictEvaluationMode } from './runtime/strict-evaluation.js'
 import { extractVerbatimPayload, findRecentVerbatimPayload, hasInlineVerbatimPayload, isVerbatimOutputRequest, isVerbatimSetup, isVerbatimStart } from './runtime/verbatim.js'
 import { refreshUserProfile } from './profile/infer.js'
+import { runPrefetch } from './prefetch/runner.js'
 
 // On first launch, copy sandbox seed files from the resource directory to the user data directory (Electron install)
 seedSandboxOnce()
@@ -109,11 +110,33 @@ let currentExecution = null
 // 处理后续消息。不修复挂着的 promise（它会留在内存里直到 GC 或自行结束），但保证 UI
 // "思考中"永远在有限时间内解锁、用户的下一句话能被正常处理。
 const RUN_TURN_WATCHDOG_MS = 600_000
+const PREFETCH_INTERVAL_MS = 1440 * 60 * 1000
 
 const PRIORITY = {
   tick: 10,
   background: 50,
   user: 100,
+}
+
+let prefetchTimer = null
+
+function startPrefetchLoop() {
+  if (prefetchTimer) clearInterval(prefetchTimer)
+
+  const run = () => {
+    runPrefetch()
+      .then((results) => {
+        const okCount = results.filter(r => r.status === 'fulfilled').length
+        const failCount = results.length - okCount
+        console.log(`[预热] 本轮完成：成功 ${okCount}，失败 ${failCount}；下次约 1440 分钟后`)
+      })
+      .catch((err) => {
+        console.warn('[预热] 本轮失败:', err?.message || err)
+      })
+  }
+
+  setTimeout(run, 3000)
+  prefetchTimer = setInterval(run, PREFETCH_INTERVAL_MS)
 }
 
 const L2_CONTEXT_HOURS = 24 * 7
@@ -482,7 +505,7 @@ async function tryHandleDirectWeatherTurn(input, msg, { finishTurn } = {}) {
   try { updateUserMessageFocusTopic(msg.fromId, msg.timestamp, '天气') } catch {}
 
   const timestamp = nowTimestamp()
-  if (isVoiceChannel(msg.channel)) autoSpeakForVoiceReply(reply)
+  if (isVoiceChannel(msg.channel)) autoSpeakForVoiceReply(reply, { clientId: msg.clientId })
   deliverFallbackReply(msg, reply, timestamp)
 
   if (hasACUIClient()) {
@@ -676,7 +699,7 @@ function voiceTurnNeedsSendMessage(text) {
 
 function deliverDirectReply(msg, content, finishTurn) {
   const timestamp = nowTimestamp()
-  if (isVoiceChannel(msg?.channel)) autoSpeakForVoiceReply(content)
+  if (isVoiceChannel(msg?.channel)) autoSpeakForVoiceReply(content, { clientId: msg.clientId })
   deliverFallbackReply(msg, content, timestamp)
   finishTurn?.(content)
 }
@@ -1356,11 +1379,29 @@ async function runTurn(input, label, msg = null) {
     // 默认关闭、用户主动开启才思考；这是用户的选择，不是 runtime 按难度替它判定。
     //
     // 流式回复：onStream 把 text/think 两种模式的 token 逐块吐出。curStreamMode 跟踪当前模式
-    // 让 stream_chunk 也带上 mode（前端据此区分"思考流"与"正文流"）。sawTextStream 标记本轮
-    // 是否流出过正文——若是，则语音 TTS 由前端边出边逐句合成（见 onToolCall 的 autoSpeak 守卫），
-    // 后端不再整段补一次 autoSpeakForVoiceReply，避免重复念。
+    // 让 stream_chunk 也带上 mode（前端据此区分"思考流"与"正文流"）。同时累计本轮已流出的
+    // 正文文本：send_message/兜底最终投递时用它判断"这段话是否已经完整交给前端逐句 TTS"。
+    // 不能只看 sawTextStream，因为工具轮可能先流出过一句"我查一下"，最终 send_message 才是真答案；
+    // 这时若被 sawTextStream 挡住，语音工作界面就会静音。
     let curStreamMode = null
     let sawTextStream = false
+    let streamedTextForSpeech = ''
+    let voiceReplyTtsDispatched = false
+    const normalizeSpeechComparable = (text) => stripMarkers(String(text || ''))
+      .replace(/\*\*\*(.+?)\*\*\*/g, '$1')
+      .replace(/\*\*(.+?)\*\*/g, '$1')
+      .replace(/\*(.+?)\*/g, '$1')
+      .replace(/`{1,3}(.+?)`{1,3}/g, '$1')
+      .replace(/#{1,6}\s+/g, '')
+      .replace(/!\[[^\]]*\]\([^\)]+\)/g, '')
+      .replace(/\[([^\]]+)\]\([^\)]+\)/g, '$1')
+      .replace(/[\s"'“”‘’`*_#\-—–~，。！？；：、,.!?;:()[\]{}<>《》【】（）]+/g, '')
+      .trim()
+    const hasAlreadyStreamedSpeech = (text) => {
+      const spoken = normalizeSpeechComparable(streamedTextForSpeech)
+      const candidate = normalizeSpeechComparable(text)
+      return !!candidate && spoken.includes(candidate)
+    }
     llmResult = await callLLM({
       systemPrompt,
       message: input,
@@ -1399,12 +1440,14 @@ async function runTurn(input, label, msg = null) {
         toolCallLog.push({ name, args: cleanArgs, result: resultText.slice(0, 500), ok, fallback: isFallbackDelivery, ack: isAckDelivery })
         // 注：send_message 的 conversations 写入已由 executor.js 内统一处理（带 channel + external_party_id）
         // 这里仅处理语音输入的 TTS 自动回放
-        // 语音渠道才自动播报。本轮若流出过正文（sawTextStream），说明前端已边出边逐句流式合成，
-        // 后端不再整段补一次，否则会和前端流式重复念。仅当没有正文流（极少：模型直接发了 send_message
-        // 而没流任何正文）时才由后端兜底整段合成，保证语音不会变哑。
-        if (name === 'send_message' && args?.content && isVoiceChannel(msg?.channel) && !sawTextStream) {
+        // 语音渠道才自动播报。若最终 send_message 内容已经完整出现在正文流中，前端已逐句合成，
+        // 后端不重复补播；若工具/兜底路径的最终内容没有被正文流覆盖，则补一次 tts_reply，避免工作界面静音。
+        if (name === 'send_message' && args?.content && isVoiceChannel(msg?.channel) && !hasAlreadyStreamedSpeech(args.content)) {
           const speakText = String(args.content).trim()
-          if (speakText) autoSpeakForVoiceReply(speakText)
+          if (speakText) {
+            autoSpeakForVoiceReply(speakText, { clientId: msg.clientId })
+            if (!isAckDelivery) voiceReplyTtsDispatched = true
+          }
         }
       },
       onRetry: ({ attempt, nextAttempt, maxAttempts, delayMs, error }) => {
@@ -1421,11 +1464,15 @@ async function runTurn(input, label, msg = null) {
           // speak：语音轮才自动播报——前端据此对正文流逐句流式合成。
           emitEvent('stream_start', {
             mode,
-            plainReply: mode === 'text' && localReply,
-            speak: mode === 'text' && voiceTurn && !silentSignal,
+            plainReply: mode === 'text' && localReply && !voiceReplyTtsDispatched,
+            speak: mode === 'text' && voiceTurn && !silentSignal && !voiceReplyTtsDispatched,
+            speechClientId: msg?.clientId || '',
           })
         } else if (event === 'chunk') {
-          if (curStreamMode === 'text') sawTextStream = true
+          if (curStreamMode === 'text') {
+            sawTextStream = true
+            streamedTextForSpeech += text || ''
+          }
           emitEvent('stream_chunk', { text, mode: curStreamMode })
         } else if (event === 'end') emitEvent('stream_end', { mode: curStreamMode })
         else if (event === 'tool_preparing') emitEvent('tool_preparing', { name })
@@ -1848,6 +1895,7 @@ async function main() {
     },
   })
   startSocialConnectors({ pushMessage, emitEvent }).catch(err => console.warn('[social] startup failed:', err.message))
+  startPrefetchLoop()
 
   // 恢复重启前未完成的 AI 视频生成任务（继续轮询，避免面板永远卡“生成中”）
   try { resumePendingVideoJobs() } catch (err) { console.warn('[aivideo] resume failed:', err.message) }

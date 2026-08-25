@@ -32,32 +32,32 @@ export const createHotspotPanel = () => `
       <div class="hs-stat-icon">⚠</div>
       <div class="hs-stat-body">
         <div class="hs-stat-label">全球预警事件</div>
-        <div class="hs-stat-value" id="hs-stat-alert">7</div>
-        <div class="hs-stat-delta hs-delta-up" id="hs-stat-alert-delta">较前15分钟 ↑2</div>
+        <div class="hs-stat-value" id="hs-stat-alert">--</div>
+        <div class="hs-stat-delta" id="hs-stat-alert-delta">等待真实源分析</div>
       </div>
     </div>
     <div class="hs-stat hs-stat--hot">
       <div class="hs-stat-icon">🔥</div>
       <div class="hs-stat-body">
         <div class="hs-stat-label">高关注度事件</div>
-        <div class="hs-stat-value" id="hs-stat-hot">23</div>
-        <div class="hs-stat-delta hs-delta-up" id="hs-stat-hot-delta">较前15分钟 ↑6</div>
+        <div class="hs-stat-value" id="hs-stat-hot">--</div>
+        <div class="hs-stat-delta" id="hs-stat-hot-delta">等待态势样本</div>
       </div>
     </div>
     <div class="hs-stat hs-stat--data">
       <div class="hs-stat-icon">◈</div>
       <div class="hs-stat-body">
         <div class="hs-stat-label">信息源总量</div>
-        <div class="hs-stat-value" id="hs-stat-data">2.37M</div>
-        <div class="hs-stat-delta" id="hs-stat-data-delta">实时数据流/分钟</div>
+        <div class="hs-stat-value" id="hs-stat-data">--</div>
+        <div class="hs-stat-delta" id="hs-stat-data-delta">等待热榜数据</div>
       </div>
     </div>
     <div class="hs-stat hs-stat--ai">
       <div class="hs-stat-icon">⬡</div>
       <div class="hs-stat-body">
         <div class="hs-stat-label">AI 分析置信度</div>
-        <div class="hs-stat-value" id="hs-stat-ai">87%</div>
-        <div class="hs-stat-delta" id="hs-stat-ai-delta">模型状态：稳定</div>
+        <div class="hs-stat-value" id="hs-stat-ai">--</div>
+        <div class="hs-stat-delta" id="hs-stat-ai-delta">6小时态势缓存</div>
       </div>
     </div>
   </div>
@@ -67,6 +67,19 @@ export const createHotspotPanel = () => `
 
     <!-- 左柱 -->
     <div class="hs-col hs-col-left">
+
+      <!-- AI 人工智能热点 -->
+      <div class="hs-list-card" id="hs-ai-card">
+        <div class="hs-card-header">
+          <span class="hs-platform-dot hs-dot-ai"></span>
+          <span class="hs-platform-name">AI人工智能</span>
+          <span class="hs-card-badge">专题榜</span>
+          <span class="hs-card-update" id="hs-ai-update">刚刚更新</span>
+        </div>
+        <ul class="hs-list" id="hs-ai-list">
+          <!-- JS 动态填充 -->
+        </ul>
+      </div>
 
       <!-- 抖音热榜 -->
       <div class="hs-list-card" id="hs-douyin-card">
@@ -112,12 +125,7 @@ export const createHotspotPanel = () => `
         <div class="hs-aux-box">
           <div class="hs-aux-title">区域关注度 <span class="hs-aux-sub">实时排名</span></div>
           <div class="hs-region-list" id="hs-region-list">
-            <div class="hs-region-row"><span class="hs-region-name">亚太地区</span><div class="hs-bar-track"><div class="hs-bar-fill" style="width:78%"></div></div><span class="hs-region-pct">78%</span></div>
-            <div class="hs-region-row"><span class="hs-region-name">北美地区</span><div class="hs-bar-track"><div class="hs-bar-fill" style="width:62%"></div></div><span class="hs-region-pct">62%</span></div>
-            <div class="hs-region-row"><span class="hs-region-name">欧洲地区</span><div class="hs-bar-track"><div class="hs-bar-fill" style="width:48%"></div></div><span class="hs-region-pct">48%</span></div>
-            <div class="hs-region-row"><span class="hs-region-name">中东地区</span><div class="hs-bar-track"><div class="hs-bar-fill" style="width:33%"></div></div><span class="hs-region-pct">33%</span></div>
-            <div class="hs-region-row"><span class="hs-region-name">南美地区</span><div class="hs-bar-track"><div class="hs-bar-fill" style="width:27%"></div></div><span class="hs-region-pct">27%</span></div>
-            <div class="hs-region-row"><span class="hs-region-name">非洲地区</span><div class="hs-bar-track"><div class="hs-bar-fill" style="width:19%"></div></div><span class="hs-region-pct">19%</span></div>
+            <div class="hs-region-empty">等待真实热点样本生成区域关注度</div>
           </div>
         </div>
 
@@ -125,19 +133,19 @@ export const createHotspotPanel = () => `
           <div class="hs-aux-title">情绪指数 <span class="hs-aux-sub">实时指标</span></div>
           <div class="hs-sentiment">
             <div class="hs-sentiment-ring">
-              <svg viewBox="0 0 80 80" class="hs-ring-svg" aria-hidden="true">
-                <circle cx="40" cy="40" r="28" fill="none" stroke="var(--line-strong)" stroke-width="5"/>
-                <circle cx="40" cy="40" r="28" fill="none" stroke="var(--cool)" stroke-width="5"
-                  stroke-dasharray="175.9" stroke-dashoffset="70"
-                  stroke-linecap="round" transform="rotate(-90 40 40)"
+              <svg viewBox="0 0 68 68" class="hs-ring-svg" aria-hidden="true">
+                <circle cx="34" cy="34" r="24" fill="none" stroke="var(--line-strong)" stroke-width="5"/>
+                <circle cx="34" cy="34" r="24" fill="none" stroke="var(--cool)" stroke-width="5"
+                  stroke-dasharray="150.8" stroke-dashoffset="60"
+                  stroke-linecap="round" transform="rotate(-90 34 34)"
                   id="hs-sentiment-arc"/>
               </svg>
               <div class="hs-ring-label">
-                <div class="hs-ring-num" id="hs-sentiment-num">64</div>
-                <div class="hs-ring-text" id="hs-sentiment-text">中性偏热</div>
+                <div class="hs-ring-num" id="hs-sentiment-num">--</div>
+                <div class="hs-ring-text" id="hs-sentiment-text">等待分析</div>
               </div>
             </div>
-            <div class="hs-sentiment-delta hs-delta-up" id="hs-sentiment-delta">↑ 3.12%</div>
+            <div class="hs-sentiment-delta" id="hs-sentiment-delta">6小时缓存</div>
           </div>
         </div>
 

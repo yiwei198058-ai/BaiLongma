@@ -26,6 +26,11 @@ const CODE_ROOT = app.getAppPath()
 const RESOURCE_ROOT = CODE_ROOT
 const BACKEND_ENTRY = path.join(CODE_ROOT, 'src', 'index.js')
 
+// Voice replies are triggered by SSE events after the user's voice turn. In
+// packaged Electron, Chromium can otherwise treat that playback as autoplay and
+// reject audioEl.play(), even though the TTS preview path works after a click.
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
+
 function getAppIconPath({ trayIcon = false } = {}) {
   if (IS_WIN) return path.join(RESOURCE_ROOT, 'build', 'icon.ico')
   if (IS_MAC) return path.join(RESOURCE_ROOT, 'build', 'icon.png')
@@ -84,6 +89,11 @@ process.on('unhandledRejection', (reason) => {
 process.on('uncaughtException', (err) => {
   console.error('[uncaughtException]', err?.stack || err?.message || String(err))
 })
+process.on('exit', (code) => {
+  try { writeLog('log', [`[process] exit code=${code}`]) } catch {}
+})
+process.on('SIGTERM', () => { console.warn('[process] SIGTERM received') })
+process.on('SIGHUP', () => { console.warn('[process] SIGHUP received') })
 console.log(`[main] Bailongma ${app.getVersion()} starting, logs → ${LOG_FILE}`)
 
 // ── GPU 适配器偏好（Windows 多显卡：核显 + 独显笔记本） ──
@@ -125,6 +135,8 @@ applyGpuPreference()
 
 let mainWindow = null
 let backendPort = 0
+let backendReady = false
+let mainWindowPromise = null
 let tray = null
 let focusBannerWindow = null
 
@@ -214,7 +226,60 @@ function waitForBackend(port, timeoutMs = 30000) {
   })
 }
 
+function waitForHttpReady(url, timeoutMs = 15000) {
+  const startedAt = Date.now()
+  let lastProbe = 'no probe completed'
+
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      if (Date.now() - startedAt > timeoutMs) {
+        reject(new Error(`Timed out waiting for ${url}. Last probe: ${lastProbe}`))
+        return
+      }
+
+      const req = http.get(url, res => {
+        res.resume()
+        lastProbe = `HTTP ${res.statusCode || 'unknown'} from ${url}`
+        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 500) {
+          resolve()
+          return
+        }
+        setTimeout(tick, 500)
+      })
+      req.on('error', err => {
+        lastProbe = err?.message || String(err)
+        setTimeout(tick, 500)
+      })
+      req.setTimeout(1500, () => {
+        lastProbe = `timeout waiting for ${url}`
+        req.destroy()
+        setTimeout(tick, 500)
+      })
+    }
+
+    tick()
+  })
+}
+
+function withTimeout(promise, timeoutMs, label) {
+  let timer
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs)
+  })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
+}
+
 async function createWindow() {
+  if (mainWindow && !mainWindow.isDestroyed()) return mainWindow
+  if (mainWindowPromise) return mainWindowPromise
+  mainWindowPromise = createWindowOnce().finally(() => {
+    mainWindowPromise = null
+  })
+  return mainWindowPromise
+}
+
+async function createWindowOnce() {
+  console.log('[main] createWindow start')
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 840,
@@ -271,9 +336,28 @@ async function createWindow() {
     return { action: 'allow' }
   })
 
-  await mainWindow.loadURL(`http://127.0.0.1:${backendPort}/`)
+  mainWindow.webContents.on('did-finish-load', () => {
+    console.log('[main] mainWindow did-finish-load')
+  })
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+    console.warn(`[main] mainWindow did-fail-load code=${errorCode} desc=${errorDescription} url=${validatedURL}`)
+  })
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    console.error('[main] renderer process gone', details)
+  })
+  mainWindow.on('unresponsive', () => {
+    console.warn('[main] mainWindow unresponsive')
+  })
+  mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    const source = sourceId ? `${path.basename(sourceId)}:${line || 0}` : `line:${line || 0}`
+    console.log(`[renderer:${level}] ${message} (${source})`)
+  })
+
+  await loadMainWindowURL()
+  console.log('[main] createWindow loaded')
   // Windows/Linux 关闭主窗口时最小化到托盘；macOS 允许销毁窗口，Dock/托盘可重建。
   mainWindow.on('close', (e) => {
+    console.log(`[main] mainWindow close isQuiting=${!!app.isQuiting}`)
     if (!app.isQuiting && !IS_MAC) {
       e.preventDefault()
       mainWindow.hide()
@@ -281,20 +365,46 @@ async function createWindow() {
   })
 
   mainWindow.on('closed', () => {
+    console.log('[main] mainWindow closed')
     mainWindow = null
   })
+
+  return mainWindow
+}
+
+async function loadMainWindowURL() {
+  const url = `http://127.0.0.1:${backendPort}/brain-ui.html`
+  const maxAttempts = 20
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await waitForHttpReady(url, 3000)
+      await withTimeout(mainWindow.loadURL(url), 8000, `loadURL ${url}`)
+      return
+    } catch (err) {
+      console.warn(`[main] loadURL failed attempt=${attempt}: ${err?.message || err}`)
+      try { mainWindow?.webContents?.stop() } catch {}
+      if (attempt === maxAttempts) throw err
+      await new Promise(resolve => setTimeout(resolve, 700))
+    }
+  }
 }
 
 async function showMainWindow() {
+  if (!backendReady) {
+    console.log('[main] showMainWindow ignored before backend ready')
+    return
+  }
   if (!mainWindow || mainWindow.isDestroyed()) {
     await createWindow()
   }
+  if (!mainWindow || mainWindow.isDestroyed()) return
   if (mainWindow.isMinimized()) mainWindow.restore()
   if (!mainWindow.isVisible()) mainWindow.show()
   mainWindow.focus()
 }
 
 function setupTray() {
+  console.log('[main] setupTray start')
   const trayImage = nativeImage.createFromPath(getAppIconPath({ trayIcon: true }))
   if (IS_MAC) trayImage.setTemplateImage(true)
   tray = new Tray(trayImage)
@@ -318,6 +428,7 @@ function setupTray() {
   tray.setContextMenu(contextMenu)
   tray.on('double-click', () => { showMainWindow().catch(() => {}) })
   if (IS_MAC) tray.on('click', () => { showMainWindow().catch(() => {}) })
+  console.log('[main] setupTray ready')
 }
 
 function createFocusBannerWindow({ task = '', current_step = '', tasks = [] } = {}) {
@@ -466,7 +577,7 @@ function setupAutoUpdater() {
     sendUpdaterStatus({ stage: 'error', message })
   })
 
-  if (!IS_DEV) {
+  if (!IS_DEV && process.env.BAILONGMA_AUTO_CHECK_UPDATES === '1') {
     autoUpdater.checkForUpdates().catch(err => {
       // 不要静默吞掉更新检查失败。GitHub 在国内经常超时/不可达，若整段吞掉，
       // 用户会卡在「永远没有更新」且无任何痕迹。这里至少落到日志，便于排查。
@@ -509,29 +620,46 @@ ipcMain.handle('updater:quit-and-install', () => {
 })
 
 app.on('second-instance', () => {
+  console.log('[main] second-instance')
   showMainWindow().catch(() => {})
 })
 
 app.on('activate', () => {
+  console.log('[main] activate')
   if (IS_MAC) showMainWindow().catch(() => {})
 })
 
 app.on('window-all-closed', () => {
+  console.log('[main] window-all-closed')
   // 主窗口关闭后保持后台运行（Focus Banner 等桌面功能继续工作）
   // 只有托盘菜单「退出」才真正退出
 })
 
 app.on('before-quit', () => {
+  console.log('[main] before-quit')
   app.isQuiting = true
 })
 
+app.on('will-quit', () => {
+  console.log('[main] will-quit')
+})
+
+app.on('quit', (_event, code) => {
+  console.log(`[main] quit code=${code}`)
+})
+
 app.whenReady().then(async () => {
+  console.log('[main] app ready')
   Menu.setApplicationMenu(null)
 
   try {
     backendPort = await findFreePort(3721)
+    console.log(`[main] bootstrapBackend port=${backendPort}`)
     await bootstrapBackend(backendPort)
+    console.log('[main] waitForBackend start')
     await waitForBackend(backendPort)
+    backendReady = true
+    console.log('[main] waitForBackend done')
   } catch (err) {
     console.error(`[main] Backend startup failed on port ${backendPort || 'unknown'}`, err?.stack || err?.message || err)
     dialog.showErrorBox('Startup failed', `Unable to start the Bailongma backend:\n${err.message}`)
@@ -539,9 +667,15 @@ app.whenReady().then(async () => {
     return
   }
 
-  await createWindow()
+  try {
+    await createWindow()
+  } catch (err) {
+    console.error('[main] createWindow failed', err?.stack || err?.message || err)
+    dialog.showErrorBox('Startup warning', `Bailongma backend is running, but the main window did not load:\n${err.message}`)
+  }
   setupTray()
   setupAutoUpdater()
+  console.log('[main] app startup complete')
   // 不再注册任何系统级 globalShortcut；F11 / F12 / Ctrl+R 已由 mainWindow
   // 的 before-input-event 处理（见 createWindow），只在窗口获焦时生效，
   // 不会劫持浏览器/IDE 等其他应用的同键操作。
