@@ -8,6 +8,13 @@
   "author": {
     "name": "xiaoyuanda666-ship-it"
   },
+  "scripts": {
+    "check": "node scripts/verify-collaboration.mjs",
+    "test:voice": "node src/test-voice-state.js && node src/test-voice-continuous.js",
+    "test:core": "node src/test-section-gate.js && node src/test-tool-router.js && node src/test-config-upgrade.js",
+    "test:api": "node src/test-api-message-utf8.js && node src/test-api-security.js",
+    "test:ci": "npm run check && npm run test:voice && npm run test:core && npm run test:api"
+  },
   "dependencies": {
     "better-sqlite3": "^12.8.0",
     "d3": "^7.9.0",
