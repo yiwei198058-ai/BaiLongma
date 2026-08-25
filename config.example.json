@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 2,
+  "voice": {
+    "whisperModel": "",
+    "voiceProvider": "",
+    "volcAsrApiKey": "",
+    "volcAsrResourceId": ""
+  },
+  "tts": {
+    "ttsProvider": "",
+    "ttsVoiceId": "",
+    "doubaoKey": ""
+  },
+  "embedding": {},
+  "clawbot": {}
+}
